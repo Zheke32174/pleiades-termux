@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""
+omnipkg — Universal package ecosystem → Gentoo container pipeline.
+
+Discovers packages from any ecosystem, converts them to Gentoo .tbz2 via
+alien-bsd, compresses to minimum footprint, and installs into the nspawn
+container via emerge --usepkgonly.
+
+Supported ecosystems: freebsd, pkgsrc, deb, rpm, apk, arch, wheel, npm, cargo
+
+Usage:
+  omnipkg convert  <pkg|dir> [--output-dir DIR] [--both] [-v]
+  omnipkg install  <atom|tbz2> [--container ROOTFS]
+  omnipkg batch    <dir> [--output-dir DIR] [--install] [-v]
+  omnipkg status
+  omnipkg list-installed
+
+Options:
+  --container ROOTFS  Path to nspawn rootfs (default: /workspaces/gentoo/root.x86_64)
+  --output-dir DIR    Where to put converted packages (default: /run/pleiades/bsd-convert/outbox)
+  --both              Produce both .deb and .tbz2 (default: .tbz2 only)
+  --install           After conversion, install into container
+  --no-compress       Skip zstd recompression step
+  -v, --verbose       Verbose output
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from pathlib import Path
+from typing import Optional
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+ALIEN_BSD    = Path(__file__).parent / "alien-bsd"
+if not ALIEN_BSD.exists():
+    ALIEN_BSD = Path("/usr/local/bin/alien-bsd")
+
+CONTAINER    = Path("/workspaces/gentoo/root.x86_64")
+OUTBOX       = Path("/run/pleiades/bsd-convert/outbox")
+BINPKG_DIR   = "var/cache/binpkgs"   # relative to container root
+FIFO         = Path("/run/pleiades/pleiades_nexus_fifo")
+LOG          = Path("/var/log/pleiades/omnipkg-installs.log")
+STATE_DIR    = Path("/var/lib/pleiades-team/omnipkg")
+INSTALL_DB   = STATE_DIR / "installed.json"
+
+RECOGNIZED_EXTS = {
+    ".deb", ".rpm", ".whl", ".crate",
+    ".pkg", ".txz",          # FreeBSD
+    ".apk",                   # Alpine (check not .pkg.tar.apk)
+}
+RECOGNIZED_PATTERNS = [
+    r"\.pkg\.tar\.(zst|xz|gz|bz2)$",   # Arch
+    r"\.tgz$",                           # pkgsrc or npm
+    r"\.tbz$",                           # pkgsrc
+]
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _log(msg: str) -> None:
+    line = f"[{time.strftime('%H:%M:%S', time.gmtime())}] [omnipkg] {msg}"
+    print(line)
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG, "a") as f:
+        print(line, file=f)
+
+def _event(msg: str) -> None:
+    try:
+        with open(FIFO, "a") as f:
+            print(msg, file=f)
+    except OSError:
+        pass
+
+def _load_db() -> dict:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if INSTALL_DB.exists():
+        try:
+            return json.loads(INSTALL_DB.read_text())
+        except Exception:
+            pass
+    return {}
+
+def _save_db(db: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    INSTALL_DB.write_text(json.dumps(db, indent=2))
+
+def _is_recognized(p: Path) -> bool:
+    if p.suffix.lower() in RECOGNIZED_EXTS:
+        # exclude Alpine .apk that's actually .pkg.tar.apk handled by arch path
+        if p.suffix.lower() == ".apk" and ".pkg.tar." in p.name.lower():
+            return False
+        return True
+    name_lower = p.name.lower()
+    return any(re.search(pat, name_lower) for pat in RECOGNIZED_PATTERNS)
+
+def _find_packages(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path] if _is_recognized(path) else []
+    pkgs = []
+    for p in sorted(path.rglob("*")):
+        if p.is_file() and _is_recognized(p):
+            pkgs.append(p)
+    return pkgs
+
+# ── Compression ──────────────────────────────────────────────────────────────
+
+def compress_for_transfer(src: Path, dst_dir: Path) -> Path:
+    """
+    Recompress package to minimum footprint using zstd -19.
+    Returns path to compressed file in dst_dir.
+    If zstd is unavailable or output is larger, returns original.
+    """
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    if not shutil.which("zstd"):
+        dst = dst_dir / src.name
+        if dst != src:
+            shutil.copy2(src, dst)
+        return dst
+
+    # Don't recompress .tbz2 (Portage requires bzip2 — leave as-is)
+    if src.suffix.lower() in (".tbz2", ".tbz"):
+        dst = dst_dir / src.name
+        if dst != src:
+            shutil.copy2(src, dst)
+        return dst
+
+    zst_name = src.stem + ".zst" if not src.name.endswith(".zst") else src.name
+    dst = dst_dir / zst_name
+
+    # Decompress if already compressed (re-compress at higher level)
+    with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tf:
+        raw = Path(tf.name)
+    try:
+        # Try to decompress first (handles .gz, .bz2, .xz, .zst)
+        decomp = subprocess.run(
+            ["zstd", "-d", "--force", "-o", str(raw), str(src)],
+            capture_output=True
+        )
+        if decomp.returncode != 0:
+            # Not zstd — use Python to decompress via tarfile trick
+            shutil.copy2(src, raw)
+
+        comp = subprocess.run(
+            ["zstd", "-19", "--force", "-o", str(dst), str(raw)],
+            capture_output=True
+        )
+        if comp.returncode != 0 or (dst.exists() and dst.stat().st_size >= src.stat().st_size):
+            # No gain — use original
+            dst = dst_dir / src.name
+            shutil.copy2(src, dst)
+    finally:
+        raw.unlink(missing_ok=True)
+
+    orig_kb = src.stat().st_size // 1024
+    comp_kb = dst.stat().st_size // 1024
+    savings  = orig_kb - comp_kb
+    _log(f"  compress: {src.name} {orig_kb}KB → {comp_kb}KB (saved {savings}KB)")
+    return dst
+
+# ── Conversion ───────────────────────────────────────────────────────────────
+
+def convert_package(
+    pkg_path: Path,
+    output_dir: Path,
+    both: bool = False,
+    verbose: bool = False,
+    no_compress: bool = False,
+) -> list[Path]:
+    """
+    Convert one package to .tbz2 (and optionally .deb).
+    Returns list of output paths.
+    """
+    if not ALIEN_BSD.exists():
+        raise RuntimeError(f"alien-bsd not found at {ALIEN_BSD}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    flags = ["--both"] if both else ["--to-gentoo"]
+    cmd = [
+        sys.executable, str(ALIEN_BSD),
+        *flags,
+        "--output-dir", str(output_dir),
+    ]
+    if verbose:
+        cmd.append("-v")
+    cmd.append(str(pkg_path))
+
+    _log(f"converting {pkg_path.name} ...")
+    result = subprocess.run(cmd, capture_output=not verbose, text=True)
+    if result.returncode != 0:
+        err = result.stderr or result.stdout or "(no output)"
+        _log(f"  ERROR: alien-bsd failed for {pkg_path.name}: {err[:200]}")
+        _event(f"OMNIPKG|convert_error|{pkg_path.name}")
+        return []
+
+    # Collect outputs
+    outputs = []
+    for ext in (".tbz2", ".deb"):
+        stem_candidates = list(output_dir.glob(f"*{ext}"))
+        # Pick most recently modified matching file
+        new_files = [f for f in stem_candidates
+                     if f.stat().st_mtime >= (time.time() - 120)]
+        outputs.extend(new_files)
+
+    if not outputs:
+        # Fallback: any new file in output_dir
+        outputs = [f for f in output_dir.iterdir()
+                   if f.is_file() and f.stat().st_mtime >= (time.time() - 120)]
+
+    _event(f"OMNIPKG|converted|{pkg_path.name}|outputs={len(outputs)}")
+
+    if not no_compress:
+        compressed = []
+        for out in outputs:
+            compressed.append(compress_for_transfer(out, output_dir))
+        outputs = compressed
+
+    return outputs
+
+# ── Container install ─────────────────────────────────────────────────────────
+
+def _container_pid(rootfs: Path) -> Optional[int]:
+    """Find the init PID of the running nspawn container for this rootfs."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-a", "systemd-nspawn"],
+            capture_output=True, text=True,
+        )
+        for line in result.stdout.splitlines():
+            if str(rootfs) in line:
+                return int(line.split()[0])
+    except Exception:
+        pass
+    return None
+
+def _atom_installed_in_container(atom: str, rootfs: Path) -> Optional[str]:
+    """Check if atom already satisfied in Gentoo container. Returns version or None."""
+    cat_pn = atom.lstrip("=<>~").split(":")[0]
+    db_dir = rootfs / "var/db/pkg"
+    if "/" in cat_pn:
+        cat, pn = cat_pn.split("/", 1)
+        pkg_entries = list((db_dir / cat).glob(f"{pn}-*")) if (db_dir / cat).exists() else []
+        if pkg_entries:
+            return pkg_entries[0].name
+    return None
+
+def install_tbz2(tbz2: Path, container: Path, verbose: bool = False) -> bool:
+    """
+    Install a .tbz2 into the Gentoo container:
+    1. Stage into container's BINPKG_DIR
+    2. Run emerge --usepkgonly inside via nsenter (or chroot fallback)
+    """
+    # Infer atom from filename: name-ver.tbz2
+    stem = tbz2.stem   # e.g. libfoo-1.2.3
+    m = re.match(r"^(.+?)-(\d[\d._]*)(.*)$", stem)
+    if not m:
+        _log(f"  WARN: cannot infer atom from {tbz2.name}")
+        return False
+
+    pkg_name = m.group(1)
+
+    # Read XPAK to get CATEGORY
+    cat = _xpak_get(tbz2, "CATEGORY") or "app-misc"
+    pf  = _xpak_get(tbz2, "PF") or stem
+
+    atom = f"{cat}/{pkg_name}"
+
+    # Check for existing installation
+    existing = _atom_installed_in_container(atom, container)
+    if existing:
+        _log(f"  skip: {atom} already satisfied by {existing}")
+        _event(f"OMNIPKG|skip_existing|{atom}")
+        return True
+
+    # Stage .tbz2 into container binpkg dir
+    binpkg_cat_dir = container / BINPKG_DIR / cat
+    binpkg_cat_dir.mkdir(parents=True, exist_ok=True)
+    staged = binpkg_cat_dir / tbz2.name
+    shutil.copy2(tbz2, staged)
+
+    if verbose:
+        _log(f"  staged: {staged}")
+
+    # Try nsenter into container
+    container_pid = _container_pid(container)
+    if container_pid:
+        cmd = [
+            "nsenter", f"--target={container_pid}",
+            "--mount", "--uts", "--ipc", "--net", "--pid",
+            "--",
+            "emerge", "--usepkgonly", "--oneshot", "--quiet", atom
+        ]
+    else:
+        # Fallback: chroot
+        cmd = [
+            "chroot", str(container),
+            "emerge", "--usepkgonly", "--oneshot", "--quiet", atom
+        ]
+
+    _log(f"  installing {atom} into container ...")
+    result = subprocess.run(cmd, capture_output=not verbose, text=True)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "")[:300]
+        _log(f"  ERROR: emerge failed for {atom}: {err}")
+        _event(f"OMNIPKG|install_error|{atom}")
+        return False
+
+    db = _load_db()
+    db[atom] = {
+        "pf": pf,
+        "cat": cat,
+        "tbz2": str(tbz2),
+        "installed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ecosystem": _xpak_get(tbz2, "ALIEN_SRC_ECOSYSTEM") or "unknown",
+    }
+    _save_db(db)
+    _event(f"OMNIPKG|installed|{atom}")
+    _log(f"  OK: {atom} installed")
+    return True
+
+def _xpak_get(tbz2: Path, key: str) -> Optional[str]:
+    """Read one key from XPAK block appended to a .tbz2."""
+    try:
+        import struct as _struct
+        data = tbz2.read_bytes()
+        if not data.endswith(b"XPAKSTOP"):
+            return None
+        xpak_size = _struct.unpack(">I", data[-12:-8])[0]
+        xpak = data[-(xpak_size + 12):-12]
+        if not xpak.startswith(b"XPAKBEGIN"):
+            return None
+        idx_len = _struct.unpack(">I", xpak[9:13])[0]
+        dat_len = _struct.unpack(">I", xpak[13:17])[0]
+        idx_raw = xpak[17:17 + idx_len]
+        dat_raw = xpak[17 + idx_len:17 + idx_len + dat_len]
+        pos = 0
+        while pos < len(idx_raw):
+            nlen = _struct.unpack(">I", idx_raw[pos:pos+4])[0]; pos += 4
+            name = idx_raw[pos:pos+nlen].decode("utf-8", errors="replace"); pos += nlen
+            doff = _struct.unpack(">I", idx_raw[pos:pos+4])[0]; pos += 4
+            dsz  = _struct.unpack(">I", idx_raw[pos:pos+4])[0]; pos += 4
+            if name == key:
+                return dat_raw[doff:doff+dsz].decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    return None
+
+# ── Batch ─────────────────────────────────────────────────────────────────────
+
+def batch_convert(
+    src_dir: Path,
+    output_dir: Path,
+    install: bool = False,
+    container: Path = CONTAINER,
+    both: bool = False,
+    verbose: bool = False,
+    no_compress: bool = False,
+) -> dict:
+    pkgs = _find_packages(src_dir)
+    if not pkgs:
+        _log(f"No recognized packages found in {src_dir}")
+        return {"found": 0, "converted": 0, "installed": 0, "errors": 0}
+
+    _log(f"Found {len(pkgs)} package(s) in {src_dir}")
+    _event(f"OMNIPKG|batch_start|dir={src_dir}|count={len(pkgs)}")
+
+    converted = []
+    errors = 0
+    for pkg in pkgs:
+        outputs = convert_package(pkg, output_dir, both=both,
+                                   verbose=verbose, no_compress=no_compress)
+        if outputs:
+            converted.extend([o for o in outputs if o.suffix == ".tbz2"])
+        else:
+            errors += 1
+
+    installed_count = 0
+    if install and converted:
+        _log(f"Installing {len(converted)} package(s) into container ...")
+        for tbz2 in converted:
+            if install_tbz2(tbz2, container, verbose=verbose):
+                installed_count += 1
+
+    summary = {
+        "found": len(pkgs),
+        "converted": len(converted),
+        "installed": installed_count,
+        "errors": errors,
+    }
+    _event(f"OMNIPKG|batch_done|converted={len(converted)}|installed={installed_count}|errors={errors}")
+    _log(f"Batch complete: {summary}")
+    return summary
+
+# ── Status / list ─────────────────────────────────────────────────────────────
+
+def cmd_status() -> None:
+    inbox  = Path("/run/pleiades/bsd-convert/inbox")
+    outbox = OUTBOX
+
+    print("=== omnipkg status ===")
+    print(f"alien-bsd:  {ALIEN_BSD} ({'ok' if ALIEN_BSD.exists() else 'MISSING'})")
+    print(f"container:  {CONTAINER} ({'ok' if CONTAINER.exists() else 'not found'})")
+    print(f"inbox:      {inbox} ({len(list(inbox.glob('*'))) if inbox.exists() else 0} pending)")
+    print(f"outbox:     {outbox} ({len(list(outbox.glob('*.tbz2'))) if outbox.exists() else 0} converted)")
+    db = _load_db()
+    print(f"installed:  {len(db)} alien package(s) in container")
+
+    # ecosystem breakdown
+    eco_counts: dict = {}
+    for v in db.values():
+        eco = v.get("ecosystem", "unknown")
+        eco_counts[eco] = eco_counts.get(eco, 0) + 1
+    if eco_counts:
+        print("  by ecosystem:", "  ".join(f"{k}={v}" for k, v in sorted(eco_counts.items())))
+
+def cmd_list_installed() -> None:
+    db = _load_db()
+    if not db:
+        print("No alien-installed packages recorded.")
+        return
+    print(f"{'ATOM':<40} {'ECOSYSTEM':<12} {'INSTALLED'}")
+    print("-" * 75)
+    for atom, meta in sorted(db.items()):
+        print(f"{atom:<40} {meta.get('ecosystem','?'):<12} {meta.get('installed_utc','?')}")
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="omnipkg: universal package ecosystem → Gentoo container pipeline"
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # convert
+    pc = sub.add_parser("convert", help="Convert one package to .tbz2 (and optionally .deb)")
+    pc.add_argument("package")
+    pc.add_argument("--output-dir", "-o", default=str(OUTBOX))
+    pc.add_argument("--both", action="store_true")
+    pc.add_argument("--no-compress", action="store_true")
+    pc.add_argument("--verbose", "-v", action="store_true")
+
+    # install
+    pi = sub.add_parser("install", help="Install a .tbz2 into the Gentoo container")
+    pi.add_argument("package", help=".tbz2 file or Gentoo atom")
+    pi.add_argument("--container", default=str(CONTAINER))
+    pi.add_argument("--verbose", "-v", action="store_true")
+
+    # batch
+    pb = sub.add_parser("batch", help="Convert all packages in a directory")
+    pb.add_argument("directory")
+    pb.add_argument("--output-dir", "-o", default=str(OUTBOX))
+    pb.add_argument("--install", action="store_true")
+    pb.add_argument("--container", default=str(CONTAINER))
+    pb.add_argument("--both", action="store_true")
+    pb.add_argument("--no-compress", action="store_true")
+    pb.add_argument("--verbose", "-v", action="store_true")
+
+    # status / list
+    sub.add_parser("status", help="Show omnipkg status")
+    sub.add_parser("list-installed", help="List alien-installed atoms in container")
+
+    args = p.parse_args()
+
+    if args.cmd == "convert":
+        outputs = convert_package(
+            Path(args.package).resolve(),
+            Path(args.output_dir),
+            both=args.both,
+            verbose=args.verbose,
+            no_compress=args.no_compress,
+        )
+        for o in outputs:
+            print(f"  → {o}")
+        sys.exit(0 if outputs else 1)
+
+    elif args.cmd == "install":
+        pkg = Path(args.package)
+        if pkg.exists() and pkg.suffix == ".tbz2":
+            ok = install_tbz2(pkg, Path(args.container), verbose=args.verbose)
+        else:
+            _log(f"ERROR: {args.package} must be an existing .tbz2 file")
+            ok = False
+        sys.exit(0 if ok else 1)
+
+    elif args.cmd == "batch":
+        summary = batch_convert(
+            Path(args.directory).resolve(),
+            Path(args.output_dir),
+            install=args.install,
+            container=Path(args.container),
+            both=args.both,
+            verbose=args.verbose,
+            no_compress=args.no_compress,
+        )
+        print(json.dumps(summary, indent=2))
+        sys.exit(0 if summary["errors"] == 0 else 1)
+
+    elif args.cmd == "status":
+        cmd_status()
+
+    elif args.cmd == "list-installed":
+        cmd_list_installed()
+
+
+if __name__ == "__main__":
+    main()
