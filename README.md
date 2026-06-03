@@ -1,6 +1,12 @@
-# Pleiades Termux
+# Pleiades Termux Companion
 
-Termux-adapted sister repo of [pleiades](https://github.com/Zheke32174/pleiades). Runs on Android via Termux with no systemd, no root, and no systemd-nspawn.
+Android/Termux companion repo for Pleiades. It adapts the desktop/container-oriented Pleiades workflow so it can run from Termux with no systemd, no root requirement, and no systemd-nspawn dependency.
+
+## What This Is
+
+Pleiades Termux Companion provides the mobile-side environment, compatibility helpers, setup scripts, and adapted agent scripts used to run Pleiades workflows from Android/Termux.
+
+It is intended for owner-authorized development, defensive research, local automation, and lab testing.
 
 ## What's Adapted
 
@@ -30,7 +36,7 @@ pleiades info
 | Sister Repo | Original | Purpose |
 |-------------|----------|---------|
 | **pleiades-termux** | [pleiades](https://github.com/Zheke32174/pleiades) | Host scripts, agent suite, env config |
-| [pleiades-container-termux](https://github.com/Zheke32174/pleiades-container-termux) | [pleiades-container](https://github.com/Zheke32174/pleiades-container) | Container bootstrap (stubs) |
+| [pleiades-container-termux](https://github.com/Zheke32174/pleiades-container-termux) | [pleiades-container](https://github.com/Zheke32174/pleiades-container) | Container bootstrap/reference stubs |
 | [pleiades-factory-stack-termux](https://github.com/Zheke32174/pleiades-factory-stack-termux) | [pleiades-factory-stack](https://github.com/Zheke32174/pleiades-factory-stack) | Toolchain bootstrap |
 
 ## Files Layout
@@ -44,7 +50,7 @@ pleiades-termux/
 │   ├── bootstrap-termux.sh       — One-shot setup
 │   ├── pleiades-mcp-config.json.tpl  — MCP config template
 │   └── tool-manifest.json.tpl        — Tool manifest template
-├── scripts/                      — Adapted agent scripts (30 scripts)
+├── scripts/                      — Adapted agent scripts
 ├── pleiades-backup.sh            — Backup helper
 ├── pleiades-factory-tools.sh     — Factory tools CLI
 ├── tm-context.sh                 — Task Master context bridge
@@ -58,3 +64,9 @@ pleiades-termux/
 - No systemd, systemd-nspawn, WSL, or sudo dependency
 - Data stored under `$PREFIX/var/pleiades/` and `$TMPDIR/pleiades/`
 - Factory tools bootstrap clones to `$PLEIADES_TOOLS`
+
+## Safety Notes
+
+- Review scripts before running them on a daily-use device.
+- Lab/stress-test scripts are intended for controlled local testing only.
+- Do not commit local config files, API keys, tokens, evidence logs, or device-specific output.
