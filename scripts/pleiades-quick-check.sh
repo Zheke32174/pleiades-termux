@@ -16,16 +16,17 @@ source "${PLEIADES_TERMUX_LIB:-}" 2>/dev/null || true
 
 set -euo pipefail
 
-SCORE_FILE="/run/pleiades/forensic_score"
-ANOMALY_FILE="/run/pleiades/forensic_anomalies"
-FIFO="/run/pleiades/pleiades-nexus_fifo"
-STATE_DIR="/var/lib/pleiades-team/forensic"
+SCORE_FILE="${PREFIX:-/data/data/com.termux/files/usr}/var/run/pleiades/forensic_score"
+ANOMALY_FILE="${PREFIX:-/data/data/com.termux/files/usr}/var/run/pleiades/forensic_anomalies"
+FIFO="${PREFIX:-/data/data/com.termux/files/usr}/var/run/pleiades/pleiades-nexus_fifo"
+STATE_DIR="${PREFIX:-/data/data/com.termux/files/usr}/var/lib/pleiades-team/forensic"
+LOG_DIR="${PREFIX:-/data/data/com.termux/files/usr}/var/log/pleiades"
 INTERVAL=15
 
-mkdir -p "$STATE_DIR"
+mkdir -p "$STATE_DIR" "$LOG_DIR" "$(dirname "$FIFO")"
 
 event()  { printf '%s\n' "$1" >> "$FIFO" 2>/dev/null || true; }
-log()    { echo "[$(date -u +%H:%M:%S)] [quick] $*" >> /var/log/pleiades/quick-check.log; }
+log()    { echo "[$(date -u +%H:%M:%S)] [quick] $*" >> "$LOG_DIR/quick-check.log"; }
 
 score_incr() {
     local amount=$1 msg="$2"
@@ -39,13 +40,14 @@ score_incr() {
 
 # ─── 1. Auth failure detection ──────────────────────────────────────────────────
 check_auth_journal() {
-    local auth_counter="/run/pleiades/auth_fail_count"
+    local auth_counter="${PREFIX:-/data/data/com.termux/files/usr}/var/run/pleiades/auth_fail_count"
     local count=0
-    
+
     # Read any auth alerts from the decisions directory
-    if [[ -d "/run/pleiades/decisions" ]]; then
-        count=$(find /run/pleiades/decisions -name "*.auth_alert" 2>/dev/null | wc -l)
+    if [[ -d "${PREFIX:-/data/data/com.termux/files/usr}/var/run/pleiades/decisions" ]]; then
+        count=$(find "${PREFIX:-/data/data/com.termux/files/usr}/var/run/pleiades/decisions" -name "*.auth_alert" 2>/dev/null | wc -l)
     fi
+
     
     # Write to the counter file for the main scanner
     echo "$count" > "$auth_counter" 2>/dev/null || true
