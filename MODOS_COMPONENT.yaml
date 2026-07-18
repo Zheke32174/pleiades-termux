@@ -1,0 +1,38 @@
+apiVersion: modos.pleiades/v1alpha1
+kind: Component
+metadata:
+  name: pleiades-termux-edge-adapter
+  repository: Zheke32174/pleiades-termux
+  visibility: public
+  lifecycle: operational
+  defaultBranch: main
+spec:
+  roles:
+    - android-termux-adapter
+    - intermittent-edge-node
+    - mobile-service-bridge
+  authority: local-enforcement
+  inputs:
+    - signed-edge-workloads
+    - mobile-resource-observations
+    - cached-local-policy
+  outputs:
+    - edge-node-inventory
+    - buffered-domain-events
+    - mobile-workload-status
+  capabilitiesProvided:
+    - node.android.termux
+    - workload.edge.local
+    - event.buffer.mobile
+  capabilitiesRequired:
+    - host.android.local
+    - network.intermittent
+    - policy.local.read
+    - audit.append
+  dataClasses:
+    - public
+    - private
+    - untrusted
+  failurePolicy: degrade-local
+  promotionPolicy: signed-pr
+  notes: The Termux layer is an edge adapter, not a replacement Android kernel; disconnected operation must remain explicit and bounded.
