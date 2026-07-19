@@ -49,11 +49,13 @@ jobs:
           ! grep -nE 'root\.x86_64/scripts|for script in .*scripts|API_KEY|settings\.json' env/bootstrap-termux.sh
           grep -Fq 'authority": "none"' bin/pleiades-edge.py
           grep -Fq 'authority": "observation-only"' bin/pleiades-edge.py
-          grep -Fq 'Event IDs and monotonic per-node sequence numbers' README.md
+          grep -Fq 'strictly increasing per-node sequences' README.md
+          grep -Fq 'no automatic network transmission' README.md
           grep -Fq 'requires --yes because it deletes queued events' env/uninstall-termux.sh
           ! find . -type f -not -path './.git/*' \( -name '*.key' -o -name '*.pem' -o -name '*.p12' -o -name '.env' \) -print -quit | grep -q .
 
       - name: Capture public-tree and history scan
+        if: always()
         id: sensitivity
         run: |
           set +e
