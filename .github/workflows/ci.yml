@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile edge runtime
+        run: python3 -m py_compile bin/pleiades-edge.py
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Shell syntax
+        run: |
+          bash -n env/pleiades-env.sh
+          bash -n env/pleiades-termux-lib.sh
+          bash -n env/pleiades-termux-cli.sh
+          bash -n env/bootstrap-termux.sh
+      - name: Edge boundary invariants
+        run: |
+          set -euo pipefail
+          ! grep -nE '^(systemctl|sudo|nsenter|machinectl|systemd-nspawn|pgrep)\(\)' env/pleiades-termux-lib.sh
+          ! grep -nE 'root\.x86_64/scripts|for script in .*scripts|API_KEY|settings\.json' env/bootstrap-termux.sh
+          grep -Fq 'authority": "none"' bin/pleiades-edge.py
+          grep -Fq 'authority": "observation-only"' bin/pleiades-edge.py
+          grep -Fq 'Event IDs and monotonic per-node sequence numbers' README.md
+      - name: Secret-shaped file guard
+        run: |
+          set -euo pipefail
+          ! find . -type f -not -path './.git/*' \( -name '*.key' -o -name '*.pem' -o -name '*.p12' -o -name '.env' \) -print -quit | grep -q .

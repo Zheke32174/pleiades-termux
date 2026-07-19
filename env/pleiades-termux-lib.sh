@@ -1,144 +1,51 @@
-#!/data/data/com.termux/files/usr/bin/env bash
-# pleiades-termux-lib.sh — Termux compatibility layer for Pleiades
-# Source this at the top of any agent script when running in Termux.
+#!/usr/bin/env bash
+# Safe helper library for the Pleiades Android/Termux edge node.
 #
-# Provides:
-#   - Writable path mappings for /var/, /run/, /etc/, /usr/local/
-#   - Stub functions for systemd/systemctl/sudo/nsenter
-#   - Logging and state management helpers
+# This library intentionally does not override systemctl, sudo, pgrep,
+# nsenter, machinectl, or systemd-nspawn. Pretending those facilities exist
+# hides failures and can cause desktop/server scripts to run in the wrong
+# authority domain.
 
 [[ -n "${_PLEIADES_TERMUX_LIB_LOADED:-}" ]] && return 0
 _PLEIADES_TERMUX_LIB_LOADED=1
 
-export PLEIADES_ENV="${PLEIADES_ENV:-termux}"
+export PLEIADES_ENV="android-termux-edge"
+: "${PLEIADES_ROOT:=${HOME}/.local/share/pleiades-edge}"
+: "${PLEIADES_CONFIG:=${PLEIADES_ROOT}/config}"
+: "${PLEIADES_STATE:=${PLEIADES_ROOT}/state}"
+: "${PLEIADES_QUEUE:=${PLEIADES_ROOT}/queue}"
+: "${PLEIADES_EXPORTS:=${PLEIADES_ROOT}/exports}"
+: "${PLEIADES_TOOLS:=${PLEIADES_ROOT}/tools}"
 
-# ── Base directories (configurable) ─────────────────────────────────────────
-: "${PLEIADES_RUN_DIR:=${TMPDIR}/pleiades/run}"
-: "${PLEIADES_VAR_DIR:=${PREFIX}/var/pleiades}"
-: "${PLEIADES_ETC_DIR:=${PLEIADES_CONFIG:-${HOME}/pleiades/config}}"
-: "${PLEIADES_USR_LOCAL_DIR:=${PREFIX}/local}"
-: "${PLEIADES_LOG_DIR:=${PLEIADES_VAR_DIR}/log}"
-: "${PLEIADES_LIB_DIR:=${PLEIADES_VAR_DIR}/lib}"
-: "${PLEIADES_STATE_DIR:=${PLEIADES_LIB_DIR}/pleiades-team}"
-: "${PLEIADES_PLEIADES_DIR:=${PLEIADES_LIB_DIR}/pleiades}"
-: "${PLEIADES_CAP_DIR:=${PLEIADES_RUN_DIR}/capabilities}"
-: "${PLEIADES_FIFO:=${PLEIADES_RUN_DIR}/pleiades-nexus_fifo}"
+export PLEIADES_ROOT PLEIADES_CONFIG PLEIADES_STATE PLEIADES_QUEUE PLEIADES_EXPORTS PLEIADES_TOOLS
 
-# ── Create writable directory structure ─────────────────────────────────────
-_pleiades_mkdirs() {
-  mkdir -p \
-    "${PLEIADES_RUN_DIR}" \
-    "${PLEIADES_LOG_DIR}" \
-    "${PLEIADES_LIB_DIR}" \
-    "${PLEIADES_STATE_DIR}" \
-    "${PLEIADES_PLEIADES_DIR}" \
-    "${PLEIADES_CAP_DIR}" \
-    "${PLEIADES_ETC_DIR}"
-}
-_pleiades_mkdirs
-
-# ── Create FIFO if missing ──────────────────────────────────────────────────
-if [[ ! -p "${PLEIADES_FIFO}" ]]; then
-  mkfifo "${PLEIADES_FIFO}" 2>/dev/null || true
-fi
-
-# ── Path resolution helpers ─────────────────────────────────────────────────
-pleiades_resolve_run()  { printf '%s' "${PLEIADES_RUN_DIR}/${1}"; }
-pleiades_resolve_var()  { printf '%s' "${PLEIADES_VAR_DIR}/${1}"; }
-pleiades_resolve_lib()  { printf '%s' "${PLEIADES_LIB_DIR}/${1}"; }
-pleiades_resolve_log()  { printf '%s' "${PLEIADES_LOG_DIR}/${1}"; }
-pleiades_resolve_state(){ printf '%s' "${PLEIADES_STATE_DIR}/${1}"; }
-
-# ── Logging helper ──────────────────────────────────────────────────────────
-pleiades_log() {
-  local name="${1:-pleiades}" msg="${2:-}"
-  local logfile="${PLEIADES_LOG_DIR}/${name}.log"
-  local line="[$(date -u +%H:%M:%S)] [$$] ${msg}"
-  echo "${line}" >> "${logfile}"
-  echo "${line}"
+pleiades_edge_mkdirs() {
+  umask 077
+  mkdir -p -- \
+    "${PLEIADES_ROOT}" \
+    "${PLEIADES_CONFIG}" \
+    "${PLEIADES_STATE}" \
+    "${PLEIADES_QUEUE}" \
+    "${PLEIADES_EXPORTS}" \
+    "${PLEIADES_TOOLS}"
+  chmod 700 -- "${PLEIADES_ROOT}" "${PLEIADES_CONFIG}" "${PLEIADES_STATE}" \
+    "${PLEIADES_QUEUE}" "${PLEIADES_EXPORTS}" "${PLEIADES_TOOLS}" 2>/dev/null || true
 }
 
-# ── State file helpers ──────────────────────────────────────────────────────
-pleiades_write_score() {
-  local score="$1" msg="${2:-}"
-  echo "${score}" > "${PLEIADES_RUN_DIR}/forensic_score"
-  [[ -n "${msg}" ]] && echo "${msg}" >> "${PLEIADES_RUN_DIR}/forensic_anomalies"
-}
-
-pleiades_read_score() {
-  cat "${PLEIADES_RUN_DIR}/forensic_score" 2>/dev/null || echo 0
-}
-
-pleiades_fifo_event() {
-  printf '%s\n' "$1" >> "${PLEIADES_FIFO}" 2>/dev/null || true
-}
-
-# ── Stub: systemctl (not available in Termux) ───────────────────────────────
-systemctl() {
-  case "${1:-}" in
-    is-active|is-enabled|status)
-      echo "inactive" ;;
-    is-system-running)
-      echo "offline" ;;
-    daemon-reload|enable|disable|start|stop|restart|reload)
-      return 0 ;;
-    list-units|list-unit-files|list-dependencies)
-      echo "" ;;
-    show)
-      echo "" ;;
+pleiades_edge_require_termux() {
+  case "${PREFIX:-}" in
+    *com.termux*/usr|*/usr) return 0 ;;
     *)
-      return 1 ;;
+      echo "pleiades-edge: this adapter is intended for Termux on Android" >&2
+      return 64
+      ;;
   esac
 }
 
-# ── Stub: systemd-detect-virt ───────────────────────────────────────────────
-systemd-detect-virt() {
-  echo "none"
+pleiades_edge_cli() {
+  local repo_root
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  exec python3 "${repo_root}/bin/pleiades-edge.py" "$@"
 }
 
-# ── Stub: systemd-nspawn ────────────────────────────────────────────────────
-systemd-nspawn() {
-  echo "[termux-stub] systemd-nspawn not available in Termux" >&2
-  return 1
-}
-
-# ── Stub: nsenter ───────────────────────────────────────────────────────────
-nsenter() {
-  echo "[termux-stub] nsenter not available in Termux" >&2
-  return 1
-}
-
-# ── Stub: machinectl ────────────────────────────────────────────────────────
-machinectl() {
-  echo "[termux-stub] machinectl not available in Termux" >&2
-  return 1
-}
-
-# ── Stub: sudo (Termux has no real sudo) ────────────────────────────────────
-sudo() {
-  if [[ "$1" == "-E" ]]; then shift; fi
-  if [[ "$1" == "-u" ]]; then shift 2; fi
-  if [[ "$1" == "nsenter" ]]; then
-    shift
-    # Skip nsenter args
-    while [[ "$1" == -* ]]; do shift; done
-    # If remaining is bash -c, run it
-    if [[ "$1" == "bash" && "$2" == "-c" ]]; then
-      shift 2
-      bash -c "$@"
-    else
-      "$@"
-    fi
-  else
-    "$@"
-  fi
-}
-
-# ── Stub: pgrep with systemd-nspawn filter ──────────────────────────────────
-pgrep() {
-  if [[ "$*" == *"systemd-nspawn"* ]]; then
-    echo ""
-    return 1
-  fi
-  command pgrep "$@"
-}
+pleiades_edge_mkdirs
