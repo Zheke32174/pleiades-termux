@@ -102,7 +102,7 @@ def scan_history(root: pathlib.Path) -> list[str]:
             continue
         text = decode_text(content.stdout)
         if text is not None:
-            findings.extend(scan_text("history", sha[:12], path, text))
+            findings.extend(scan_text("history", sha, path, text))
     return findings
 
 
