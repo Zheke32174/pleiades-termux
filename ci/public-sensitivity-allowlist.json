@@ -1,0 +1,26 @@
+{
+  "schema": "pleiades.public-sensitivity-review/v1",
+  "findings": [
+    {
+      "path": "scripts/Taygete.sh",
+      "rule": "linux-user-home",
+      "line_sha256": "2d4a358a5acc",
+      "classification": "synthetic-decoy-fixture",
+      "rationale": "Static fake /home/ubuntu SSH-path fixture in quarantined historical deception code; not operator or user data. Excluded from release/source-files.txt."
+    },
+    {
+      "path": "scripts/Taygete.sh",
+      "rule": "linux-user-home",
+      "line_sha256": "4a6666c39440",
+      "classification": "synthetic-decoy-fixture",
+      "rationale": "Static fake /home/ubuntu environment-file fixture using an explicit non-secret canary; not operator or user data. Excluded from release/source-files.txt."
+    },
+    {
+      "path": "scripts/Taygete.sh",
+      "rule": "linux-user-home",
+      "line_sha256": "ef43161e7eb7",
+      "classification": "synthetic-decoy-fixture",
+      "rationale": "Static tilde-expansion target for the same fake ubuntu decoy profile; not operator or user data. Excluded from release/source-files.txt."
+    }
+  ]
+}
