@@ -1,50 +1,81 @@
-# Pleiades Android Edge Node
+# Pleiades Android Edge Node for Termux
 
-`pleiades-termux` is the constrained Android/Termux edge adapter for Pleiades.
+> **Status:** experimental but working local edge runtime. The queue, identity, event validation, export, and refusal behavior are tested. Automatic authenticated upload and acknowledged compaction are not implemented.
 
-It is not a portable copy of the server swarm. It does not emulate systemd, root, `systemd-nspawn`, host policy authority, process-kill authority, or an arbitrary command broker. Its supported job is deliberately smaller:
+`pleiades-termux` is the constrained Android/Termux observation edge for Pleiades. It is not an Android APK, server swarm, root manager, container runtime, policy authority, or arbitrary command broker.
 
-- create a stable local node identity;
-- accept typed observation events;
-- preserve them in a private durable queue;
-- expose local status and capability declarations;
-- export a copy for an authenticated upstream ingestion path;
-- serve as an operator client for separately authorized systems.
+Its supported role is deliberately small:
 
-## Why this repository changed
+- create one stable local node identity;
+- accept typed `pleiades.event/v1` observations;
+- append them to a private durable local queue;
+- expose local status and explicit capability declarations;
+- export a non-destructive copy for later reviewed ingestion;
+- remain honest about absent root, systemd, container, enforcement, process-control, and global-authority capabilities.
 
-The earlier adaptation copied server scripts into Termux and replaced unavailable commands such as `systemctl`, `sudo`, and `nsenter` with compatibility functions. That made incompatible scripts appear successful while silently removing their real security and lifecycle semantics.
+## Download
 
-The v1 edge runtime removes that illusion. Unsupported authority is now declared absent rather than simulated.
+Open the [GitHub Releases page](https://github.com/Zheke32174/pleiades-termux/releases) and download:
 
-## Current boundary
+`pleiades-termux-<version>.tar.gz`
+
+A proper release also contains:
+
+- `SHA256SUMS.txt`;
+- an SPDX 2.3 JSON source inventory;
+- an exact-commit build receipt.
+
+This is a **Termux source bundle**, not an APK. The release does not contain Android app binaries, credentials, local queue data, an OCI image, or an automatic upstream transport.
+
+Until the first verified asset-bearing tag is published, use a reviewed checkout:
+
+```bash
+pkg install python git
+git clone https://github.com/Zheke32174/pleiades-termux.git
+cd pleiades-termux
+```
+
+## Install
+
+Preview without changing state or shell configuration:
+
+```bash
+bash env/bootstrap-termux.sh --dry-run
+```
+
+Initialize private state and install the `pleiades` CLI symlink:
+
+```bash
+bash env/bootstrap-termux.sh
+pleiades doctor
+pleiades info
+```
+
+Add the environment source line to the active Bash or Zsh startup file only when explicitly requested:
+
+```bash
+bash env/bootstrap-termux.sh --install-shell-hook
+```
+
+The bootstrap does not install server agents, fake system services, containers, credentials, or third-party research tools.
+
+## Event flow
 
 ```text
-Android / Termux observations
+Android / Termux observation
           ↓
 pleiades.event/v1 validation
           ↓
 private append-only local queue
-          ↓ explicit export copy
+          ↓ explicit non-destructive export
 future authenticated ingestion gateway
           ↓
-Pleiades evidence and knowledge planes
+reviewed evidence and knowledge planes
 ```
 
-There is no automatic network transmission in this repository yet. Export does not delete or acknowledge queued records.
+There is **no automatic network transmission** in this repository. Export does not acknowledge or delete queued records. A future transport must authenticate the node, acknowledge exact event IDs, resist replay, apply bounded retry/backpressure, and define retention before compaction can be added.
 
-## Quick start
-
-```bash
-pkg install python git
-
-git clone https://github.com/Zheke32174/pleiades-termux.git
-cd pleiades-termux
-bash env/bootstrap-termux.sh --install-shell-hook
-
-pleiades doctor
-pleiades info
-```
+## Use
 
 Emit a typed observation:
 
@@ -55,30 +86,37 @@ pleiades emit android.package.observed \
   --payload-json '{"package":"example.app","state":"installed"}'
 ```
 
-Inspect and export the queue:
+Inspect recent events and capabilities:
 
 ```bash
 pleiades show --limit 20
+pleiades capabilities
+pleiades info
+```
+
+Export a copy:
+
+```bash
 pleiades export "$HOME/storage/shared/pleiades-edge.jsonl"
 ```
 
-The export is a copy. A future authenticated transport must acknowledge event IDs before local compaction is introduced.
+The exported file may enter shared Android storage and inherit broader access than the private queue. Review and move or delete exports deliberately.
 
 ## CLI
 
 | Command | Purpose |
 |---|---|
-| `pleiades init` | Initialize private state and node identity |
+| `pleiades init` | Initialize private state and stable node identity |
 | `pleiades info` | Generate and print a local status snapshot |
 | `pleiades doctor` | Check Termux, permissions, and runtime assumptions |
 | `pleiades capabilities` | Show implemented and explicitly absent capabilities |
 | `pleiades emit ...` | Append one typed observation event |
 | `pleiades show` | Inspect recent queued events |
-| `pleiades export PATH` | Atomically copy the queue to a private export file |
+| `pleiades export PATH` | Atomically copy the queue without deletion |
 
-## Runtime layout
+## Local data
 
-By default, state lives under:
+Default state:
 
 ```text
 ~/.local/share/pleiades-edge/
@@ -94,45 +132,83 @@ By default, state lives under:
 └── tools/
 ```
 
-Directories are created with private permissions. Runtime state, exports, credentials, and local overrides must not be committed.
+Directories are created with private permissions. The node identity, event queue, status snapshots, exports, and local overrides must not be committed.
 
-## Legacy scripts
+Queue writes use one serialized commit fence covering sequence recovery, allocation, append, flush, and sequence-cache update. Reads and exports share the queue fence. Event records have bounded size, unique IDs, and strictly increasing per-node sequences.
 
-The repository still contains historical copied scripts under `scripts/` and several old top-level helpers so their provenance and prior experiments are not destroyed during this transition. They are **not part of the supported v1 runtime**, are not installed by `bootstrap-termux.sh`, and must not be interpreted as Android-safe simply because they have a Termux shebang.
+## Uninstall and retention
 
-The intended cleanup path is:
-
-1. extract any genuinely useful sensor mechanism;
-2. rewrite it as an observation-only adapter producing `pleiades.event/v1`;
-3. test it without fake privilege or lifecycle commands;
-4. delete or archive the copied legacy implementation.
-
-## Security properties
-
-- No global command overrides.
-- No `sudo`, systemd, container, or namespace emulation.
-- No API-key template generation.
-- No automatic edits to shell startup files unless `--install-shell-hook` is explicit.
-- No automatic third-party repository cloning.
-- No direct policy or enforcement action.
-- Event IDs and monotonic per-node sequence numbers support future replay protection.
-- Queue writes are locked and flushed before success is reported.
-- Export is atomic and non-destructive.
-
-## Relationship to the other Termux repositories
-
-- `pleiades-container-termux` is now a deprecation/redirect repository because nspawn containers cannot be meaningfully implemented in ordinary Termux.
-- `pleiades-factory-stack-termux` is a thin platform adapter to the canonical locked `pleiades-factory-stack`; it must not maintain a second floating tool list.
-- `pleiades-factory` evaluates evidence and promotion eligibility off-device; this edge node has no promotion authority.
-
-## Development
+Remove only the CLI symlink owned by this checkout while preserving queue and identity state:
 
 ```bash
-python3 -m py_compile bin/pleiades-edge.py
-python3 -m unittest discover -s tests -v
-bash -n env/*.sh
+bash env/uninstall-termux.sh
 ```
 
-## License
+Also remove this checkout's exact shell-startup hook:
 
-MIT — see [LICENSE](LICENSE).
+```bash
+bash env/uninstall-termux.sh --remove-shell-hook
+```
+
+Delete recognized edge state and queued observations only with explicit destructive confirmation:
+
+```bash
+bash env/uninstall-termux.sh --remove-shell-hook --purge-state --yes
+```
+
+The uninstaller refuses to remove a foreign/non-symlink CLI path, refuses state outside the user's home, and refuses an unrecognized state tree.
+
+## Legacy material
+
+Historical copied scripts remain under `scripts/` for provenance. They are not installed, placed on `PATH`, or supported merely because they use a Termux shebang.
+
+A legacy mechanism can re-enter the supported runtime only after it is rewritten as an observation-only adapter, emits typed events, avoids fake authority, and has tests for its data and failure boundaries.
+
+## Security boundary
+
+- No global command overrides.
+- No `sudo`, systemd, namespace, nspawn, or process-control emulation.
+- No API-key template generation.
+- No automatic shell-startup modification.
+- No automatic third-party cloning.
+- No direct policy, installation, enforcement, or promotion action.
+- No automatic upload, deletion, or queue compaction.
+- Durable writes and exports report success only after bounded validation and flush behavior.
+
+UIDs, Termux process context, or possession of an exported file do not establish global Pleiades authority.
+
+See [SECURITY.md](SECURITY.md) for vulnerability and trust boundaries and [PRIVACY.md](PRIVACY.md) for local storage, exports, retention, and deletion.
+
+## Related public repositories
+
+- [`pleiades`](https://github.com/Zheke32174/pleiades) — public contracts and bounded host/runtime architecture;
+- [`pleiades-factory-stack-termux`](https://github.com/Zheke32174/pleiades-factory-stack-termux) — thin Termux adapter to the locked public source catalog;
+- [`pleiades-container-termux`](https://github.com/Zheke32174/pleiades-container-termux) — deprecation/redirect surface because ordinary Termux cannot provide systemd-nspawn.
+
+Off-device evaluation and promotion remain separate authority domains; this edge runtime cannot promote its own observations.
+
+## Development and release validation
+
+```bash
+python3 -m py_compile bin/pleiades-edge.py ci/scan_public_repo.py scripts/write_spdx_sbom.py
+python3 -m unittest discover -s tests -v
+bash -n env/*.sh scripts/package_source.sh tests/test_uninstall.sh
+bash tests/test_uninstall.sh
+python3 ci/scan_public_repo.py
+bash scripts/package_source.sh dist
+(cd dist && sha256sum -c SHA256SUMS.txt)
+```
+
+CI also builds the source distribution twice and requires byte-identical outputs.
+
+## Update and rollback
+
+Update by moving to a reviewed tag or commit and rerunning the bootstrap. The CLI symlink follows the selected checkout. Runtime queue and identity state are not replaced by a source update.
+
+Rollback by restoring the previous reviewed source checkout or release. Preserve the local state directory unless the rollback procedure explicitly requires a separately backed-up state migration.
+
+## License and support
+
+MIT — see [LICENSE](LICENSE). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [CHANGELOG.md](CHANGELOG.md).
+
+This is a small experimental project. No response-time, production-support, Android-version, Termux-distribution, or long-term compatibility guarantee is offered.
