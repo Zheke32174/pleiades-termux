@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Pleiades Android/Termux edge-node runtime.
 
-The edge node is a sensor, queue, and operator client. It does not impersonate
-systemd, root, a container runtime, or the Pleiades authority broker.
+The edge node is a sensor, durable observation queue, and operator client. It
+does not impersonate systemd, root, a container runtime, an ingress receiver,
+or the Pleiades authority broker.
 """
 
 from __future__ import annotations
@@ -24,6 +25,9 @@ from typing import Any, Iterator
 EVENT_SCHEMA = "pleiades.event/v1"
 STATUS_SCHEMA = "pleiades.edge-status/v1"
 CAPABILITY_SCHEMA = "pleiades.edge-capabilities/v1"
+DELIVERY_STATE_API = "modos.pleiades/v1alpha1"
+DELIVERY_STATE_KIND = "DeliveryStreamState"
+UNCONFIGURED_RECEIVER = "receiver://unconfigured"
 EVENT_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,95}$")
 SEVERITIES = {"debug", "info", "notice", "warning", "high", "critical"}
 MAX_EVENT_BYTES = 1024 * 1024
@@ -50,10 +54,18 @@ def paths() -> dict[str, pathlib.Path]:
     root = root_path()
     return {
         "root": root,
-        "config": pathlib.Path(os.environ.get("PLEIADES_CONFIG", root / "config")).expanduser(),
-        "state": pathlib.Path(os.environ.get("PLEIADES_STATE", root / "state")).expanduser(),
-        "queue": pathlib.Path(os.environ.get("PLEIADES_QUEUE", root / "queue")).expanduser(),
-        "exports": pathlib.Path(os.environ.get("PLEIADES_EXPORTS", root / "exports")).expanduser(),
+        "config": pathlib.Path(
+            os.environ.get("PLEIADES_CONFIG", root / "config")
+        ).expanduser(),
+        "state": pathlib.Path(
+            os.environ.get("PLEIADES_STATE", root / "state")
+        ).expanduser(),
+        "queue": pathlib.Path(
+            os.environ.get("PLEIADES_QUEUE", root / "queue")
+        ).expanduser(),
+        "exports": pathlib.Path(
+            os.environ.get("PLEIADES_EXPORTS", root / "exports")
+        ).expanduser(),
     }
 
 
@@ -100,7 +112,9 @@ def file_lock(path: pathlib.Path, *, shared: bool = False) -> Iterator[None]:
 
 def atomic_bytes(path: pathlib.Path, data: bytes, mode: int = 0o600) -> None:
     ensure_private_directory(path.parent)
-    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    temporary = path.with_name(
+        f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    )
     fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
     try:
         write_all(fd, data)
@@ -147,6 +161,7 @@ def default_capabilities() -> dict[str, Any]:
         "implemented": [
             "pleiades.event.enqueue",
             "pleiades.queue.inspect",
+            "pleiades.delivery-stream.inspect",
             "pleiades.status.snapshot",
             "pleiades.export.copy",
         ],
@@ -158,41 +173,104 @@ def default_capabilities() -> dict[str, Any]:
             "process-kill-authority",
             "network-containment-authority",
             "arbitrary-command-broker",
+            "automatic-event-upload",
+            "acknowledgement-compaction",
+            "reverse-command-channel",
         ],
     }
 
 
-def initialize() -> dict[str, Any]:
-    layout = paths()
-    for key in ("root", "config", "state", "queue", "exports"):
-        ensure_private_directory(layout[key])
+def producer_principal_id(node: dict[str, Any]) -> str:
+    node_id = node.get("node_id")
+    if not isinstance(node_id, str) or not node_id:
+        raise EdgeError("node identity is missing or invalid")
+    return f"sensor://pleiades/android-termux/{node_id}"
 
-    with file_lock(layout["state"] / "initialize.lock"):
-        node_path = layout["config"] / "node.json"
-        if node_path.exists():
-            node = load_json(node_path)
-        else:
-            node = {
-                "schema": "pleiades.edge-node/v1",
-                "node_id": str(uuid.uuid4()),
-                "created_at": utc_now(),
-                "platform": "android-termux",
-            }
-            atomic_json(node_path, node)
 
-        capability_path = layout["config"] / "capabilities.json"
-        if not capability_path.exists():
-            atomic_json(capability_path, default_capabilities())
+def new_delivery_state(
+    node: dict[str, Any],
+    queued_high_water: int,
+    queue_bytes: int,
+) -> dict[str, Any]:
+    now = utc_now()
+    return {
+        "apiVersion": DELIVERY_STATE_API,
+        "kind": DELIVERY_STATE_KIND,
+        "metadata": {
+            "producerPrincipalId": producer_principal_id(node),
+            "receiverPrincipalId": UNCONFIGURED_RECEIVER,
+            "deliveryStreamId": (
+                "stream://pleiades/android-termux/"
+                f"{node['node_id']}/{uuid.uuid4()}"
+            ),
+            "generation": 1,
+            "createdAt": now,
+            "observedAt": now,
+        },
+        "state": {
+            "nextSequence": queued_high_water + 1,
+            "queuedHighWater": queued_high_water,
+            "acknowledgedHighWater": 0,
+            "pendingEvents": queued_high_water,
+            "pendingBytes": queue_bytes,
+            "health": "healthy",
+        },
+    }
 
-        sequence_path = layout["state"] / "sequence"
-        if not sequence_path.exists():
-            atomic_text(sequence_path, "0\n")
 
-        queue_path = layout["queue"] / "events.jsonl"
-        if not queue_path.exists():
-            atomic_bytes(queue_path, b"")
-
-    return node
+def validate_delivery_state(
+    value: dict[str, Any],
+    node: dict[str, Any],
+) -> None:
+    if value.get("apiVersion") != DELIVERY_STATE_API:
+        raise EdgeError("delivery stream state has an unsupported apiVersion")
+    if value.get("kind") != DELIVERY_STATE_KIND:
+        raise EdgeError("delivery stream state has an invalid kind")
+    metadata = value.get("metadata")
+    state = value.get("state")
+    if not isinstance(metadata, dict) or not isinstance(state, dict):
+        raise EdgeError("delivery stream state is missing metadata or state")
+    if metadata.get("producerPrincipalId") != producer_principal_id(node):
+        raise EdgeError("delivery stream producer identity does not match this node")
+    if metadata.get("receiverPrincipalId") != UNCONFIGURED_RECEIVER:
+        raise EdgeError("edge runtime has no configured ingress receiver")
+    stream_id = metadata.get("deliveryStreamId")
+    if not isinstance(stream_id, str) or not stream_id.startswith(
+        "stream://pleiades/android-termux/"
+    ):
+        raise EdgeError("delivery stream identity is invalid")
+    generation = metadata.get("generation")
+    if not isinstance(generation, int) or generation < 1:
+        raise EdgeError("delivery stream generation is invalid")
+    for field in (
+        "nextSequence",
+        "queuedHighWater",
+        "acknowledgedHighWater",
+        "pendingEvents",
+        "pendingBytes",
+    ):
+        item = state.get(field)
+        if not isinstance(item, int) or item < 0:
+            raise EdgeError(f"delivery stream {field} is invalid")
+    queued = state["queuedHighWater"]
+    acknowledged = state["acknowledgedHighWater"]
+    if acknowledged != 0:
+        raise EdgeError(
+            "acknowledged delivery state is impossible before ingress is implemented"
+        )
+    if state["nextSequence"] != queued + 1:
+        raise EdgeError("delivery stream next sequence is discontinuous")
+    if state["pendingEvents"] != queued - acknowledged:
+        raise EdgeError("delivery stream pending count is inconsistent")
+    if state.get("health") not in {
+        "healthy",
+        "backlogged",
+        "receiver-unavailable",
+        "corrupt",
+        "collision",
+        "paused",
+    }:
+        raise EdgeError("delivery stream health is invalid")
 
 
 def read_sequence_state(path: pathlib.Path) -> int:
@@ -237,18 +315,113 @@ def last_queue_sequence(queue_path: pathlib.Path) -> int:
     return sequence
 
 
+def reconcile_delivery_state(
+    node: dict[str, Any],
+    layout: dict[str, pathlib.Path],
+) -> dict[str, Any]:
+    queue_path = layout["queue"] / "events.jsonl"
+    state_path = layout["state"] / "delivery-stream.json"
+    queued_high_water = last_queue_sequence(queue_path)
+    try:
+        queue_bytes = queue_path.stat().st_size
+    except OSError as exc:
+        raise EdgeError(f"cannot stat event queue: {exc}") from exc
+
+    if state_path.exists():
+        delivery = load_json(state_path)
+        validate_delivery_state(delivery, node)
+        state = delivery["state"]
+        if state["queuedHighWater"] > queued_high_water:
+            raise EdgeError(
+                "delivery state is ahead of the durable queue; create a new stream "
+                "through an explicit recovery procedure"
+            )
+        changed = False
+        if state["queuedHighWater"] < queued_high_water:
+            state["queuedHighWater"] = queued_high_water
+            state["nextSequence"] = queued_high_water + 1
+            state["pendingEvents"] = queued_high_water
+            changed = True
+        if state["pendingBytes"] != queue_bytes:
+            state["pendingBytes"] = queue_bytes
+            changed = True
+        if changed:
+            delivery["metadata"]["observedAt"] = utc_now()
+            atomic_json(state_path, delivery)
+        return delivery
+
+    delivery = new_delivery_state(node, queued_high_water, queue_bytes)
+    atomic_json(state_path, delivery)
+    return delivery
+
+
+def initialize() -> dict[str, Any]:
+    layout = paths()
+    for key in ("root", "config", "state", "queue", "exports"):
+        ensure_private_directory(layout[key])
+
+    with file_lock(layout["state"] / "initialize.lock"):
+        node_path = layout["config"] / "node.json"
+        if node_path.exists():
+            node = load_json(node_path)
+        else:
+            node = {
+                "schema": "pleiades.edge-node/v1",
+                "node_id": str(uuid.uuid4()),
+                "created_at": utc_now(),
+                "platform": "android-termux",
+            }
+            atomic_json(node_path, node)
+
+        capability_path = layout["config"] / "capabilities.json"
+        if not capability_path.exists():
+            atomic_json(capability_path, default_capabilities())
+
+        sequence_path = layout["state"] / "sequence"
+        if not sequence_path.exists():
+            atomic_text(sequence_path, "0\n")
+
+        queue_path = layout["queue"] / "events.jsonl"
+        if not queue_path.exists():
+            atomic_bytes(queue_path, b"")
+
+        with file_lock(layout["state"] / "queue.lock"):
+            reconcile_delivery_state(node, layout)
+
+    return node
+
+
+def delivery_stream_state() -> dict[str, Any]:
+    node = initialize()
+    layout = paths()
+    with file_lock(layout["state"] / "queue.lock", shared=True):
+        delivery = load_json(layout["state"] / "delivery-stream.json")
+        validate_delivery_state(delivery, node)
+        queued_high_water = last_queue_sequence(layout["queue"] / "events.jsonl")
+        if delivery["state"]["queuedHighWater"] != queued_high_water:
+            raise EdgeError("delivery stream state does not match queue high-water mark")
+        return delivery
+
+
 def commit_event(event: dict[str, Any]) -> dict[str, Any]:
-    initialize()
+    node = initialize()
     layout = paths()
     sequence_path = layout["state"] / "sequence"
     queue_path = layout["queue"] / "events.jsonl"
+    delivery_path = layout["state"] / "delivery-stream.json"
     with file_lock(layout["state"] / "queue.lock"):
         current = max(
             read_sequence_state(sequence_path),
             last_queue_sequence(queue_path),
         )
+        delivery = reconcile_delivery_state(node, layout)
+        if delivery["state"]["queuedHighWater"] != current:
+            raise EdgeError("delivery stream and queue sequence floors disagree")
+        sequence = current + 1
         committed = dict(event)
-        committed["sequence"] = current + 1
+        committed["sequence"] = sequence
+        committed["delivery_sequence"] = sequence
+        committed["delivery_stream_id"] = delivery["metadata"]["deliveryStreamId"]
         encoded = (
             json.dumps(
                 committed,
@@ -266,7 +439,15 @@ def commit_event(event: dict[str, Any]) -> dict[str, Any]:
             os.fsync(fd)
         finally:
             os.close(fd)
-        atomic_text(sequence_path, f"{committed['sequence']}\n")
+        atomic_text(sequence_path, f"{sequence}\n")
+
+        state = delivery["state"]
+        state["nextSequence"] = sequence + 1
+        state["queuedHighWater"] = sequence
+        state["pendingEvents"] = sequence
+        state["pendingBytes"] = queue_path.stat().st_size
+        delivery["metadata"]["observedAt"] = utc_now()
+        atomic_json(delivery_path, delivery)
         return committed
 
 
@@ -299,10 +480,12 @@ def emit(
 
 
 def read_events(limit: int | None = None) -> list[dict[str, Any]]:
-    initialize()
+    node = initialize()
     layout = paths()
     queue_path = layout["queue"] / "events.jsonl"
     with file_lock(layout["state"] / "queue.lock", shared=True):
+        delivery = load_json(layout["state"] / "delivery-stream.json")
+        validate_delivery_state(delivery, node)
         try:
             lines = queue_path.read_text(
                 encoding="utf-8",
@@ -313,6 +496,7 @@ def read_events(limit: int | None = None) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     prior_sequence = 0
     seen_ids: set[str] = set()
+    stream_id = delivery["metadata"]["deliveryStreamId"]
     for number, line in enumerate(lines, start=1):
         if not line.strip():
             continue
@@ -324,13 +508,23 @@ def read_events(limit: int | None = None) -> list[dict[str, Any]]:
             raise EdgeError(f"queue contains an invalid event at line {number}")
         sequence = value.get("sequence")
         event_id = value.get("event_id")
-        if not isinstance(sequence, int) or sequence <= prior_sequence:
-            raise EdgeError(f"queue sequence is not strictly increasing at line {number}")
+        if not isinstance(sequence, int) or sequence != prior_sequence + 1:
+            raise EdgeError(f"queue delivery sequence is not contiguous at line {number}")
         if not isinstance(event_id, str) or not event_id or event_id in seen_ids:
-            raise EdgeError(f"queue event identity is invalid or duplicated at line {number}")
+            raise EdgeError(
+                f"queue event identity is invalid or duplicated at line {number}"
+            )
+        explicit_sequence = value.get("delivery_sequence")
+        if explicit_sequence is not None and explicit_sequence != sequence:
+            raise EdgeError(f"queue delivery sequence alias differs at line {number}")
+        explicit_stream = value.get("delivery_stream_id")
+        if explicit_stream is not None and explicit_stream != stream_id:
+            raise EdgeError(f"queue event belongs to another delivery stream at line {number}")
         prior_sequence = sequence
         seen_ids.add(event_id)
         events.append(value)
+    if prior_sequence != delivery["state"]["queuedHighWater"]:
+        raise EdgeError("queue records do not match delivery stream high-water state")
     return events[-limit:] if limit is not None else events
 
 
@@ -338,6 +532,9 @@ def snapshot() -> dict[str, Any]:
     node = initialize()
     layout = paths()
     events = read_events()
+    delivery = delivery_stream_state()
+    delivery_meta = delivery["metadata"]
+    delivery_state = delivery["state"]
     status = {
         "schema": STATUS_SCHEMA,
         "generated_at": utc_now(),
@@ -348,6 +545,19 @@ def snapshot() -> dict[str, Any]:
             "records": len(events),
             "last_sequence": events[-1]["sequence"] if events else 0,
             "path": str(layout["queue"] / "events.jsonl"),
+        },
+        "delivery": {
+            "producer_principal_id": delivery_meta["producerPrincipalId"],
+            "receiver_principal_id": delivery_meta["receiverPrincipalId"],
+            "delivery_stream_id": delivery_meta["deliveryStreamId"],
+            "next_sequence": delivery_state["nextSequence"],
+            "queued_high_water": delivery_state["queuedHighWater"],
+            "acknowledged_high_water": delivery_state["acknowledgedHighWater"],
+            "pending_events": delivery_state["pendingEvents"],
+            "pending_bytes": delivery_state["pendingBytes"],
+            "health": delivery_state["health"],
+            "upload_implemented": False,
+            "compaction_implemented": False,
         },
         "capabilities": load_json(layout["config"] / "capabilities.json"),
     }
@@ -391,11 +601,25 @@ def doctor() -> tuple[dict[str, Any], bool]:
     node = initialize()
     layout = paths()
     prefix = os.environ.get("PREFIX", "")
+    try:
+        delivery = delivery_stream_state()
+        delivery_contiguous = (
+            delivery["state"]["nextSequence"]
+            == delivery["state"]["queuedHighWater"] + 1
+            and delivery["state"]["acknowledgedHighWater"] == 0
+        )
+    except EdgeError:
+        delivery_contiguous = False
     checks = {
         "python3": shutil.which("python3") is not None,
         "termux_prefix": "com.termux" in prefix or prefix.endswith("/usr"),
         "node_private": permission_string(layout["config"] / "node.json")
         in {"0o600", "0o400"},
+        "delivery_state_private": permission_string(
+            layout["state"] / "delivery-stream.json"
+        )
+        in {"0o600", "0o400"},
+        "delivery_contiguous": delivery_contiguous,
         "root_private": permission_string(layout["root"]) == "0o700",
         "queue_writable": os.access(layout["queue"], os.W_OK),
         "no_root_claim": os.geteuid() != 0,
@@ -436,6 +660,7 @@ def main() -> int:
     sub.add_parser("info")
     sub.add_parser("snapshot")
     sub.add_parser("capabilities")
+    sub.add_parser("delivery")
     sub.add_parser("doctor")
 
     emit_parser = sub.add_parser("emit")
@@ -466,6 +691,8 @@ def main() -> int:
                     sort_keys=True,
                 )
             )
+        elif args.command == "delivery":
+            print(json.dumps(delivery_stream_state(), indent=2, sort_keys=True))
         elif args.command == "doctor":
             report, healthy = doctor()
             print(json.dumps(report, indent=2, sort_keys=True))
