@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write a deterministic SPDX 2.3 JSON inventory for the exact Git commit."""
+"""Write a deterministic SPDX 2.3 JSON inventory for a reviewed source manifest."""
 
 from __future__ import annotations
 
@@ -24,10 +24,37 @@ def spdx_id(path: str) -> str:
     return f"SPDXRef-File-{hashlib.sha256(path.encode('utf-8')).hexdigest()[:24]}"
 
 
+def load_manifest(root: pathlib.Path, manifest: pathlib.Path, commit: str) -> list[str]:
+    try:
+        raw_paths = manifest.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError as exc:
+        raise SystemExit(f"source manifest not found: {manifest}") from exc
+    paths = [line.strip() for line in raw_paths if line.strip() and not line.lstrip().startswith("#")]
+    if not paths:
+        raise SystemExit("source manifest must not be empty")
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        raise SystemExit("source manifest paths must be sorted and unique")
+    for path in paths:
+        pure = pathlib.PurePosixPath(path)
+        if path.startswith("/") or ".." in pure.parts or path.endswith("/"):
+            raise SystemExit(f"unsafe source manifest path: {path}")
+        result = subprocess.run(
+            ["git", "cat-file", "-e", f"{commit}:{path}"],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise SystemExit(f"source manifest path does not exist at {commit}: {path}")
+    return paths
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=pathlib.Path)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--manifest", type=pathlib.Path, required=True)
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", args.version):
         raise SystemExit("version must be semantic-version shaped")
@@ -36,7 +63,8 @@ def main() -> int:
     commit = str(git(root, "rev-parse", "HEAD")).strip()
     epoch = int(str(git(root, "show", "-s", "--format=%ct", commit)).strip())
     created = dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    paths = sorted(line for line in str(git(root, "ls-files")).splitlines() if line)
+    manifest = args.manifest if args.manifest.is_absolute() else root / args.manifest
+    paths = load_manifest(root, manifest, commit)
 
     files = []
     relationships = [{"spdxElementId": "SPDXRef-DOCUMENT", "relationshipType": "DESCRIBES", "relatedSpdxElement": "SPDXRef-Package"}]
