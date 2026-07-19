@@ -50,6 +50,7 @@ class EdgeTests(unittest.TestCase):
         )
         self.assertEqual(first_delivery["state"]["nextSequence"], 1)
         self.assertEqual(first_delivery["state"]["acknowledgedHighWater"], 0)
+        self.assertNotIn("oldestPendingAt", first_delivery["state"])
         root = edge.paths()["root"]
         self.assertEqual(root.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.delivery_path().stat().st_mode & 0o777, 0o600)
@@ -70,6 +71,10 @@ class EdgeTests(unittest.TestCase):
         self.assertEqual(delivery["state"]["nextSequence"], 3)
         self.assertEqual(delivery["state"]["pendingEvents"], 2)
         self.assertEqual(delivery["state"]["acknowledgedHighWater"], 0)
+        self.assertEqual(
+            delivery["state"]["oldestPendingAt"],
+            first["observed_at"],
+        )
         self.assertGreater(delivery["state"]["pendingBytes"], 0)
 
     def test_sequence_cache_recovers_from_last_durable_event(self):
@@ -102,12 +107,14 @@ class EdgeTests(unittest.TestCase):
                 "pendingBytes": 0,
             }
         )
+        delivery["state"].pop("oldestPendingAt", None)
         self.delivery_path().write_text(json.dumps(delivery), encoding="utf-8")
         edge.initialize()
         recovered = edge.delivery_stream_state()
         self.assertEqual(recovered["state"]["queuedHighWater"], 1)
         self.assertEqual(recovered["state"]["nextSequence"], 2)
         self.assertEqual(recovered["state"]["pendingEvents"], 1)
+        self.assertIsInstance(recovered["state"]["oldestPendingAt"], str)
         self.assertGreater(recovered["state"]["pendingBytes"], 0)
 
     def test_delivery_state_ahead_of_queue_fails_closed(self):
@@ -130,6 +137,7 @@ class EdgeTests(unittest.TestCase):
         delivery = json.loads(self.delivery_path().read_text(encoding="utf-8"))
         delivery["state"]["acknowledgedHighWater"] = 1
         delivery["state"]["pendingEvents"] = 0
+        delivery["state"].pop("oldestPendingAt", None)
         self.delivery_path().write_text(json.dumps(delivery), encoding="utf-8")
         with self.assertRaises(edge.EdgeError):
             edge.delivery_stream_state()
@@ -166,6 +174,10 @@ class EdgeTests(unittest.TestCase):
         self.assertEqual((layout["queue"] / "events.jsonl").read_bytes(), original)
         delivery = edge.delivery_stream_state()
         self.assertEqual(delivery["state"]["queuedHighWater"], 1)
+        self.assertEqual(
+            delivery["state"]["oldestPendingAt"],
+            legacy["observed_at"],
+        )
         self.assertEqual(edge.read_events()[0]["event_id"], legacy["event_id"])
         next_event = edge.emit("android.legacy.followup", "info", "unit-test", {})
         self.assertEqual(next_event["sequence"], 2)
@@ -218,6 +230,7 @@ class EdgeTests(unittest.TestCase):
         self.assertEqual(status["delivery"]["queued_high_water"], 12)
         self.assertEqual(status["delivery"]["pending_events"], 12)
         self.assertEqual(status["delivery"]["acknowledged_high_water"], 0)
+        self.assertIsInstance(status["delivery"]["oldest_pending_at"], str)
 
     def test_snapshot_declares_no_authority_or_transport(self):
         edge.emit("android.test.event", "info", "unit-test", {})
