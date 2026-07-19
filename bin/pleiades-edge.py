@@ -187,12 +187,52 @@ def producer_principal_id(node: dict[str, Any]) -> str:
     return f"sensor://pleiades/android-termux/{node_id}"
 
 
+def first_queue_observed_at(queue_path: pathlib.Path) -> str | None:
+    try:
+        with queue_path.open("r", encoding="utf-8", errors="strict") as handle:
+            for number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise EdgeError(
+                        f"queue contains invalid JSON at line {number}"
+                    ) from exc
+                if not isinstance(value, dict) or value.get("schema") != EVENT_SCHEMA:
+                    raise EdgeError(
+                        f"queue contains an invalid event at line {number}"
+                    )
+                observed_at = value.get("observed_at")
+                if not isinstance(observed_at, str) or not observed_at:
+                    raise EdgeError(
+                        f"queue event has no observed_at at line {number}"
+                    )
+                return observed_at
+    except (OSError, UnicodeDecodeError) as exc:
+        raise EdgeError(f"cannot read oldest queue event: {exc}") from exc
+    return None
+
+
 def new_delivery_state(
     node: dict[str, Any],
     queued_high_water: int,
     queue_bytes: int,
+    oldest_pending_at: str | None,
 ) -> dict[str, Any]:
     now = utc_now()
+    state: dict[str, Any] = {
+        "nextSequence": queued_high_water + 1,
+        "queuedHighWater": queued_high_water,
+        "acknowledgedHighWater": 0,
+        "pendingEvents": queued_high_water,
+        "pendingBytes": queue_bytes,
+        "health": "healthy",
+    }
+    if queued_high_water > 0:
+        if not oldest_pending_at:
+            raise EdgeError("nonempty queue has no oldest pending timestamp")
+        state["oldestPendingAt"] = oldest_pending_at
     return {
         "apiVersion": DELIVERY_STATE_API,
         "kind": DELIVERY_STATE_KIND,
@@ -207,14 +247,7 @@ def new_delivery_state(
             "createdAt": now,
             "observedAt": now,
         },
-        "state": {
-            "nextSequence": queued_high_water + 1,
-            "queuedHighWater": queued_high_water,
-            "acknowledgedHighWater": 0,
-            "pendingEvents": queued_high_water,
-            "pendingBytes": queue_bytes,
-            "health": "healthy",
-        },
+        "state": state,
     }
 
 
@@ -254,14 +287,20 @@ def validate_delivery_state(
             raise EdgeError(f"delivery stream {field} is invalid")
     queued = state["queuedHighWater"]
     acknowledged = state["acknowledgedHighWater"]
+    pending = state["pendingEvents"]
     if acknowledged != 0:
         raise EdgeError(
             "acknowledged delivery state is impossible before ingress is implemented"
         )
     if state["nextSequence"] != queued + 1:
         raise EdgeError("delivery stream next sequence is discontinuous")
-    if state["pendingEvents"] != queued - acknowledged:
+    if pending != queued - acknowledged:
         raise EdgeError("delivery stream pending count is inconsistent")
+    oldest = state.get("oldestPendingAt")
+    if pending > 0 and (not isinstance(oldest, str) or not oldest):
+        raise EdgeError("nonempty delivery stream lacks oldest pending time")
+    if pending == 0 and oldest is not None:
+        raise EdgeError("empty delivery stream must not claim oldest pending time")
     if state.get("health") not in {
         "healthy",
         "backlogged",
@@ -322,6 +361,7 @@ def reconcile_delivery_state(
     queue_path = layout["queue"] / "events.jsonl"
     state_path = layout["state"] / "delivery-stream.json"
     queued_high_water = last_queue_sequence(queue_path)
+    oldest_pending_at = first_queue_observed_at(queue_path)
     try:
         queue_bytes = queue_path.stat().st_size
     except OSError as exc:
@@ -341,6 +381,9 @@ def reconcile_delivery_state(
             state["queuedHighWater"] = queued_high_water
             state["nextSequence"] = queued_high_water + 1
             state["pendingEvents"] = queued_high_water
+            if not oldest_pending_at:
+                raise EdgeError("nonempty queue has no oldest pending timestamp")
+            state["oldestPendingAt"] = oldest_pending_at
             changed = True
         if state["pendingBytes"] != queue_bytes:
             state["pendingBytes"] = queue_bytes
@@ -350,7 +393,12 @@ def reconcile_delivery_state(
             atomic_json(state_path, delivery)
         return delivery
 
-    delivery = new_delivery_state(node, queued_high_water, queue_bytes)
+    delivery = new_delivery_state(
+        node,
+        queued_high_water,
+        queue_bytes,
+        oldest_pending_at,
+    )
     atomic_json(state_path, delivery)
     return delivery
 
@@ -442,6 +490,8 @@ def commit_event(event: dict[str, Any]) -> dict[str, Any]:
         atomic_text(sequence_path, f"{sequence}\n")
 
         state = delivery["state"]
+        if state["pendingEvents"] == 0:
+            state["oldestPendingAt"] = committed["observed_at"]
         state["nextSequence"] = sequence + 1
         state["queuedHighWater"] = sequence
         state["pendingEvents"] = sequence
@@ -555,6 +605,7 @@ def snapshot() -> dict[str, Any]:
             "acknowledged_high_water": delivery_state["acknowledgedHighWater"],
             "pending_events": delivery_state["pendingEvents"],
             "pending_bytes": delivery_state["pendingBytes"],
+            "oldest_pending_at": delivery_state.get("oldestPendingAt"),
             "health": delivery_state["health"],
             "upload_implemented": False,
             "compaction_implemented": False,
