@@ -105,6 +105,17 @@ jobs:
             cmp "$first" "dist-two/$file"
           done
 
+      - name: Verify archive matches the reviewed source manifest
+        run: |
+          set -euo pipefail
+          VERSION="$(cat VERSION)"
+          ARCHIVE="dist-one/pleiades-termux-${VERSION}.tar.gz"
+          sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' release/source-files.txt \
+            | sed "s#^#pleiades-termux-${VERSION}/#" > expected-files.txt
+          tar -tzf "$ARCHIVE" | grep -v '/$' | LC_ALL=C sort > actual-files.txt
+          cmp expected-files.txt actual-files.txt
+          ! grep -Eq '/scripts/(Taygete|Celaeno|Sterope|Alcyone|Asterope|Atlas|Merope|Maia|Electra)\.sh$' actual-files.txt
+
       - name: Verify checksum manifest
         run: |
           cd dist-one
