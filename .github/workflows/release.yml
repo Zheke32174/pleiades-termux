@@ -1,56 +1,93 @@
-name: Release
+name: source release
 
 on:
   push:
-    branches: [ main, master ]
-    tags: [ 'v*' ]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release version/tag, for example v0.1.0'
-        required: false
-        default: 'v0.1.0'
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
-  packages: read
+
+concurrency:
+  group: source-release
+  cancel-in-progress: false
 
 jobs:
-  release:
+  publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          show-progress: false
 
-      - name: Resolve version
-        id: version
-        shell: bash
+      - name: Validate immutable version identity
         run: |
-          VERSION="${{ github.event.inputs.version }}"
-          if [ -z "$VERSION" ]; then VERSION="v0.1.0"; fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          test "$GITHUB_REF_NAME" = "v$VERSION"
 
-      - name: Write release notes
-        shell: bash
+      - name: Validate implementation and public history
         run: |
-          cat > RELEASE_NOTES.md <<EOF
-          # pleiades-termux ${{ steps.version.outputs.version }}
+          python3 -m py_compile bin/pleiades-edge.py ci/scan_public_repo.py scripts/write_spdx_sbom.py
+          python3 -m unittest discover -s tests -v
+          bash -n env/*.sh scripts/package_source.sh tests/test_uninstall.sh
+          bash tests/test_uninstall.sh
+          python3 ci/scan_public_repo.py
 
-          Public showcase release for pleiades-termux.
+      - name: Build and verify source assets
+        run: |
+          bash scripts/package_source.sh dist
+          cd dist
+          sha256sum -c SHA256SUMS.txt
 
-          GitHub Package:
-          ghcr.io/zheke32174/pleiades-termux:latest
+      - name: Write download-first release notes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
 
-          GitHub provides source ZIP and source tarball assets automatically on this Release.
-          EOF
+          version = Path("VERSION").read_text(encoding="utf-8").strip()
+          archive = f"pleiades-termux-{version}.tar.gz"
+          notes = f"""# Pleiades Termux Edge {version}
 
-      - name: Create or update GitHub Release
+## Download
+
+**Download `{archive}` from the Assets section below.**
+
+This is the source distribution for the observation-only Android/Termux edge runtime. It does not contain an APK, Android app package, server swarm, container image, credentials, queue data, or automatic upstream transport.
+
+Also download:
+
+- `SHA256SUMS.txt` to verify every asset;
+- `pleiades-termux-{version}.spdx.json` for the SPDX 2.3 source inventory;
+- `pleiades-termux-{version}.build-receipt.json` for the exact commit and package hashes.
+
+Extract inside Termux, then run `bash env/bootstrap-termux.sh --dry-run` before installation. Local queued observations are retained until the operator explicitly exports or purges them.
+"""
+          Path("dist/RELEASE-NOTES.md").write_text(notes, encoding="utf-8")
+          PY
+
+      - name: Refuse release overwrite
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
-        shell: bash
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            gh release edit "$VERSION" --target "$GITHUB_SHA" --title "pleiades-termux $VERSION" --notes-file RELEASE_NOTES.md
-          else
-            gh release create "$VERSION" --target "$GITHUB_SHA" --title "pleiades-termux $VERSION" --notes-file RELEASE_NOTES.md
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $GITHUB_REF_NAME already exists"
+            exit 1
           fi
+
+      - name: Publish immutable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz \
+            dist/*.spdx.json \
+            dist/*.build-receipt.json \
+            dist/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Pleiades Termux Edge ${GITHUB_REF_NAME#v}" \
+            --notes-file dist/RELEASE-NOTES.md \
+            --verify-tag
