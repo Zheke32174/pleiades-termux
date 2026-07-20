@@ -1,17 +1,18 @@
 # Pleiades Android Edge Node for Termux
 
-> **Status:** experimental but working local edge runtime. The queue, identity, event validation, export, and refusal behavior are tested. Automatic authenticated upload and acknowledged compaction are not implemented.
+> **Status:** experimental but working local edge runtime. The queue, identity, contiguous delivery stream, event validation, export, and refusal behavior are tested. Automatic authenticated upload, receipt processing, and acknowledged compaction are not implemented.
 
-`pleiades-termux` is the constrained Android/Termux observation edge for Pleiades. It is not an Android APK, server swarm, root manager, container runtime, policy authority, or arbitrary command broker.
+`pleiades-termux` is the constrained Android/Termux observation edge for Pleiades. It is not an Android APK, server swarm, root manager, container runtime, policy authority, ingress receiver, or arbitrary command broker.
 
 Its supported role is deliberately small:
 
 - create one stable local node identity;
+- create one durable local delivery-stream identity;
 - accept typed `pleiades.event/v1` observations;
-- append them to a private durable local queue;
-- expose local status and explicit capability declarations;
+- append them to a private durable local queue with contiguous delivery sequence;
+- expose local status, stream continuity, and explicit capability declarations;
 - export a non-destructive copy for later reviewed ingestion;
-- remain honest about absent root, systemd, container, enforcement, process-control, and global-authority capabilities.
+- remain honest about absent root, systemd, container, enforcement, process-control, upload, acknowledgement, compaction, and global-authority capabilities.
 
 ## Download
 
@@ -59,7 +60,7 @@ bash env/bootstrap-termux.sh --install-shell-hook
 
 The bootstrap does not install server agents, fake system services, containers, credentials, or third-party research tools.
 
-## Event flow
+## Event and delivery flow
 
 ```text
 Android / Termux observation
@@ -67,13 +68,30 @@ Android / Termux observation
 pleiades.event/v1 validation
           ↓
 private append-only local queue
+          ↓
+contiguous local delivery sequence
           ↓ explicit non-destructive export
-future authenticated ingestion gateway
+future authenticated observation-ingress gateway
+          ↓
+receiver-signed durable receipt
           ↓
 reviewed evidence and knowledge planes
 ```
 
-There is **no automatic network transmission** in this repository. Export does not acknowledge or delete queued records. A future transport must authenticate the node, acknowledge exact event IDs, resist replay, apply bounded retry/backpressure, and define retention before compaction can be added.
+There is **no automatic network transmission** in this repository. Export does not acknowledge or delete queued records. The local receiver identity remains explicitly `receiver://unconfigured`, and acknowledged high water remains zero.
+
+The shared transport contract is defined in `Zheke32174/pleiades#19` and the stacked public MODOS ingress-contract draft. A future sender must authenticate the stable producer principal, submit exact bounded batches, verify receiver-signed receipts, apply bounded retry/backpressure, preserve restart continuity, and define retained-window compaction before any local record can be removed.
+
+## Source position and delivery sequence
+
+Source position and delivery order are different concepts.
+
+- `sequence` is retained as the historical local queue field.
+- `delivery_sequence` is the explicit contiguous delivery position and currently equals `sequence`.
+- `delivery_stream_id` identifies one durable queue lineage.
+- queue or lineage replacement must create a new stream identity rather than silently restarting sequence 1.
+
+Legacy records that predate explicit delivery fields are adopted without rewriting their bytes. Their existing contiguous `sequence` remains the delivery position for the newly recorded stream. New records carry both the compatibility sequence and explicit delivery fields.
 
 ## Use
 
@@ -86,10 +104,11 @@ pleiades emit android.package.observed \
   --payload-json '{"package":"example.app","state":"installed"}'
 ```
 
-Inspect recent events and capabilities:
+Inspect recent events, delivery continuity, and capabilities:
 
 ```bash
 pleiades show --limit 20
+pleiades delivery
 pleiades capabilities
 pleiades info
 ```
@@ -106,13 +125,14 @@ The exported file may enter shared Android storage and inherit broader access th
 
 | Command | Purpose |
 |---|---|
-| `pleiades init` | Initialize private state and stable node identity |
+| `pleiades init` | Initialize private state, stable node identity, and delivery stream |
 | `pleiades info` | Generate and print a local status snapshot |
-| `pleiades doctor` | Check Termux, permissions, and runtime assumptions |
+| `pleiades doctor` | Check Termux, permissions, queue, and stream continuity |
 | `pleiades capabilities` | Show implemented and explicitly absent capabilities |
+| `pleiades delivery` | Show the local `DeliveryStreamState` without event bodies |
 | `pleiades emit ...` | Append one typed observation event |
 | `pleiades show` | Inspect recent queued events |
-| `pleiades export PATH` | Atomically copy the queue without deletion |
+| `pleiades export PATH` | Atomically copy the queue without acknowledgement or deletion |
 
 ## Local data
 
@@ -125,6 +145,7 @@ Default state:
 │   └── capabilities.json
 ├── state/
 │   ├── sequence
+│   ├── delivery-stream.json
 │   └── status.json
 ├── queue/
 │   └── events.jsonl
@@ -132,13 +153,25 @@ Default state:
 └── tools/
 ```
 
-Directories are created with private permissions. The node identity, event queue, status snapshots, exports, and local overrides must not be committed.
+Directories and state files are created with private permissions. The node identity, stream identity, event queue, status snapshots, exports, and local overrides must not be committed.
 
-Queue writes use one serialized commit fence covering sequence recovery, allocation, append, flush, and sequence-cache update. Reads and exports share the queue fence. Event records have bounded size, unique IDs, and strictly increasing per-node sequences.
+Queue writes use one serialized commit fence covering sequence recovery, allocation, append, flush, sequence-cache update, and delivery-state update. Reads and exports share the queue fence. Event records have bounded size, unique IDs, and contiguous per-stream delivery sequences.
+
+`delivery-stream.json` uses the public MODOS `DeliveryStreamState` shape. It records:
+
+- stable producer principal;
+- explicitly unconfigured receiver;
+- stable delivery-stream identity;
+- next sequence;
+- queued and acknowledged high water;
+- pending event and byte counts;
+- stream health.
+
+The runtime recovers a lagging local stream state from the last durable queue record. It refuses state ahead of the durable queue, forged acknowledgement, delivery gaps, stream mismatch, duplicate event IDs, or queue/state disagreement. There is no automatic repair that deletes or rewrites evidence.
 
 ## Uninstall and retention
 
-Remove only the CLI symlink owned by this checkout while preserving queue and identity state:
+Remove only the CLI symlink owned by this checkout while preserving queue, node identity, and delivery-stream state:
 
 ```bash
 bash env/uninstall-termux.sh
@@ -172,10 +205,12 @@ A legacy mechanism can re-enter the supported runtime only after it is rewritten
 - No automatic shell-startup modification.
 - No automatic third-party cloning.
 - No direct policy, installation, enforcement, or promotion action.
-- No automatic upload, deletion, or queue compaction.
+- No automatic upload, receipt acceptance, deletion, or queue compaction.
+- Export is not acknowledgement.
+- A stream high-water value is not upstream acceptance.
 - Durable writes and exports report success only after bounded validation and flush behavior.
 
-UIDs, Termux process context, or possession of an exported file do not establish global Pleiades authority.
+UIDs, Termux process context, possession of an exported file, or possession of the local stream state do not establish global Pleiades authority.
 
 See [SECURITY.md](SECURITY.md) for vulnerability and trust boundaries and [PRIVACY.md](PRIVACY.md) for local storage, exports, retention, and deletion.
 
@@ -205,10 +240,10 @@ CI also builds the source distribution twice and requires byte-identical outputs
 
 Update by moving to a reviewed tag or commit and rerunning the bootstrap. The CLI symlink follows the selected checkout. Runtime queue and identity state are not replaced by a source update.
 
-Rollback by restoring the previous reviewed source checkout or release. Preserve the local state directory unless the rollback procedure explicitly requires a separately backed-up state migration.
+A source rollback does not automatically roll back queue or delivery-stream state. Preserve the local state directory, verify schema compatibility, and use an explicit reviewed migration or recovery procedure rather than deleting or resetting sequence state.
 
 ## License and support
 
 MIT — see [LICENSE](LICENSE). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [CHANGELOG.md](CHANGELOG.md).
 
-This is a small experimental project. No response-time, production-support, Android-version, Termux-distribution, or long-term compatibility guarantee is offered.
+This is a small experimental project. No response-time, production-support, Android-version, Termux-distribution, transport, or long-term compatibility guarantee is offered.

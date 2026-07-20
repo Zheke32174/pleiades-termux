@@ -27,7 +27,14 @@ jobs:
         run: python3 -m py_compile bin/pleiades-edge.py ci/scan_public_repo.py scripts/write_spdx_sbom.py
 
       - name: Unit tests
-        run: python3 -m unittest discover -s tests -v
+        id: unit
+        run: |
+          set +e
+          python3 -m unittest discover -s tests -v > unit-tests.log 2>&1
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          cat unit-tests.log
+          exit 0
 
       - name: Shell syntax and uninstall policy
         id: shell
@@ -43,16 +50,25 @@ jobs:
           exit 0
 
       - name: Edge boundary invariants
+        id: boundary
         run: |
-          set -euo pipefail
-          ! grep -nE '^(systemctl|sudo|nsenter|machinectl|systemd-nspawn|pgrep)\(\)' env/pleiades-termux-lib.sh
-          ! grep -nE 'root\.x86_64/scripts|for script in .*scripts|API_KEY|settings\.json' env/bootstrap-termux.sh
-          grep -Fq 'authority": "none"' bin/pleiades-edge.py
-          grep -Fq 'authority": "observation-only"' bin/pleiades-edge.py
-          grep -Fq 'strictly increasing per-node sequences' README.md
-          grep -Fq 'no automatic network transmission' README.md
-          grep -Fq 'requires --yes because it deletes queued events' env/uninstall-termux.sh
-          ! find . -type f -not -path './.git/*' \( -name '*.key' -o -name '*.pem' -o -name '*.p12' -o -name '.env' \) -print -quit | grep -q .
+          set +e
+          {
+            ! grep -nE '^(systemctl|sudo|nsenter|machinectl|systemd-nspawn|pgrep)\(\)' env/pleiades-termux-lib.sh
+            ! grep -nE 'root\.x86_64/scripts|for script in .*scripts|API_KEY|settings\.json' env/bootstrap-termux.sh
+            grep -Fq 'authority": "none"' bin/pleiades-edge.py
+            grep -Fq 'authority": "observation-only"' bin/pleiades-edge.py
+            grep -Fq 'contiguous per-stream delivery sequences' README.md
+            grep -Fq 'no automatic network transmission' README.md
+            grep -Fq 'acknowledged high water remains zero' README.md
+            grep -Fq 'receiver://unconfigured' bin/pleiades-edge.py
+            grep -Fq 'requires --yes because it deletes queued events' env/uninstall-termux.sh
+            ! find . -type f -not -path './.git/*' \( -name '*.key' -o -name '*.pem' -o -name '*.p12' -o -name '.env' \) -print -quit | grep -q .
+          } > boundary.log 2>&1
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          cat boundary.log
+          exit 0
 
       - name: Capture public-tree and history scan
         if: always()
@@ -71,8 +87,10 @@ jobs:
         with:
           name: pleiades-termux-validation-${{ github.sha }}
           path: |
+            unit-tests.log
             shell-parse.log
             uninstall-tests.log
+            boundary.log
             sensitivity.log
           if-no-files-found: error
           retention-days: 14
@@ -80,8 +98,10 @@ jobs:
       - name: Enforce validation gate
         if: always()
         run: |
+          test "${{ steps.unit.outputs.status }}" = "0"
           test "${{ steps.shell.outputs.parse_status }}" = "0"
           test "${{ steps.shell.outputs.test_status }}" = "0"
+          test "${{ steps.boundary.outputs.status }}" = "0"
           test "${{ steps.sensitivity.outputs.status }}" = "0"
           test "$(cat VERSION)" = "0.2.0"
 
