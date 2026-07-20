@@ -31,6 +31,7 @@ UNCONFIGURED_RECEIVER = "receiver://unconfigured"
 EVENT_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,95}$")
 SEVERITIES = {"debug", "info", "notice", "warning", "high", "critical"}
 MAX_EVENT_BYTES = 1024 * 1024
+LIVE_PATH_KEYS = ("root", "config", "state", "queue")
 
 
 class EdgeError(ValueError):
@@ -41,40 +42,100 @@ def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def lexical_absolute(path: pathlib.Path) -> pathlib.Path:
+    return pathlib.Path(os.path.abspath(os.fspath(path.expanduser())))
+
+
 def root_path() -> pathlib.Path:
-    return pathlib.Path(
-        os.environ.get(
-            "PLEIADES_ROOT",
-            pathlib.Path.home() / ".local" / "share" / "pleiades-edge",
+    return lexical_absolute(
+        pathlib.Path(
+            os.environ.get(
+                "PLEIADES_ROOT",
+                pathlib.Path.home() / ".local" / "share" / "pleiades-edge",
+            )
         )
-    ).expanduser()
+    )
 
 
 def paths() -> dict[str, pathlib.Path]:
     root = root_path()
-    return {
+    layout = {
         "root": root,
-        "config": pathlib.Path(
-            os.environ.get("PLEIADES_CONFIG", root / "config")
-        ).expanduser(),
-        "state": pathlib.Path(
-            os.environ.get("PLEIADES_STATE", root / "state")
-        ).expanduser(),
-        "queue": pathlib.Path(
-            os.environ.get("PLEIADES_QUEUE", root / "queue")
-        ).expanduser(),
-        "exports": pathlib.Path(
-            os.environ.get("PLEIADES_EXPORTS", root / "exports")
-        ).expanduser(),
+        "config": lexical_absolute(
+            pathlib.Path(os.environ.get("PLEIADES_CONFIG", root / "config"))
+        ),
+        "state": lexical_absolute(
+            pathlib.Path(os.environ.get("PLEIADES_STATE", root / "state"))
+        ),
+        "queue": lexical_absolute(
+            pathlib.Path(os.environ.get("PLEIADES_QUEUE", root / "queue"))
+        ),
+        "exports": lexical_absolute(
+            pathlib.Path(os.environ.get("PLEIADES_EXPORTS", root / "exports"))
+        ),
     }
+    for key in ("config", "state", "queue"):
+        try:
+            layout[key].relative_to(root)
+        except ValueError as exc:
+            raise EdgeError(
+                f"{key} path must remain within PLEIADES_ROOT: {layout[key]}"
+            ) from exc
+    return layout
 
 
-def ensure_private_directory(path: pathlib.Path) -> None:
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+def _lstat(path: pathlib.Path) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise EdgeError(f"cannot inspect path {path}: {exc}") from exc
+
+
+def _assert_no_symlink_components(path: pathlib.Path) -> None:
+    absolute = lexical_absolute(path)
+    current = pathlib.Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        observed = _lstat(current)
+        if observed is not None and stat.S_ISLNK(observed.st_mode):
+            raise EdgeError(f"symlink path component refused: {current}")
+
+
+def _validate_directory(path: pathlib.Path, *, require_owner: bool) -> None:
+    observed = _lstat(path)
+    if observed is None:
+        raise EdgeError(f"managed directory is missing: {path}")
+    if stat.S_ISLNK(observed.st_mode):
+        raise EdgeError(f"symlink directory refused: {path}")
+    if not stat.S_ISDIR(observed.st_mode):
+        raise EdgeError(f"managed path is not a directory: {path}")
+    if require_owner and hasattr(os, "geteuid") and observed.st_uid != os.geteuid():
+        raise EdgeError(f"managed directory is not owned by the current user: {path}")
+
+
+def ensure_private_directory(
+    path: pathlib.Path, *, require_owner: bool = True
+) -> None:
+    path = lexical_absolute(path)
+    _assert_no_symlink_components(path)
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise EdgeError(f"cannot create managed directory {path}: {exc}") from exc
+    _assert_no_symlink_components(path)
+    _validate_directory(path, require_owner=require_owner)
     try:
         path.chmod(0o700)
-    except OSError:
-        pass
+    except OSError as exc:
+        raise EdgeError(f"cannot secure managed directory {path}: {exc}") from exc
+    _validate_directory(path, require_owner=require_owner)
+
+
+def verify_live_layout(layout: dict[str, pathlib.Path]) -> None:
+    for key in LIVE_PATH_KEYS:
+        ensure_private_directory(layout[key])
 
 
 def fsync_directory(path: pathlib.Path) -> None:
@@ -98,12 +159,52 @@ def write_all(fd: int, data: bytes) -> None:
         written += count
 
 
+def _require_regular_file(path: pathlib.Path) -> os.stat_result:
+    observed = _lstat(path)
+    if observed is None:
+        raise EdgeError(f"managed file is missing: {path}")
+    if stat.S_ISLNK(observed.st_mode):
+        raise EdgeError(f"symlink file refused: {path}")
+    if not stat.S_ISREG(observed.st_mode):
+        raise EdgeError(f"managed path is not a regular file: {path}")
+    return observed
+
+
+def _open_regular_fd(path: pathlib.Path, flags: int, mode: int = 0o600) -> int:
+    before = _lstat(path)
+    if before is not None and stat.S_ISLNK(before.st_mode):
+        raise EdgeError(f"symlink file refused: {path}")
+    safe_flags = flags | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, safe_flags, mode)
+    except OSError as exc:
+        raise EdgeError(f"cannot open managed file {path}: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise EdgeError(f"managed path is not a regular file: {path}")
+        if hasattr(os, "geteuid") and opened.st_uid != os.geteuid():
+            raise EdgeError(f"managed file is not owned by the current user: {path}")
+        linked = _require_regular_file(path)
+        if (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino):
+            raise EdgeError(f"managed file identity changed while opening: {path}")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 @contextlib.contextmanager
 def file_lock(path: pathlib.Path, *, shared: bool = False) -> Iterator[None]:
     ensure_private_directory(path.parent)
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    fd = _open_regular_fd(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        ensure_private_directory(path.parent)
+        opened = os.fstat(fd)
+        linked = _require_regular_file(path)
+        if (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino):
+            raise EdgeError(f"lock file identity changed while acquiring: {path}")
         yield
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -115,7 +216,7 @@ def atomic_bytes(path: pathlib.Path, data: bytes, mode: int = 0o600) -> None:
     temporary = path.with_name(
         f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     )
-    fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+    fd = _open_regular_fd(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
     try:
         write_all(fd, data)
         os.fsync(fd)
@@ -125,6 +226,11 @@ def atomic_bytes(path: pathlib.Path, data: bytes, mode: int = 0o600) -> None:
         raise
     else:
         os.close(fd)
+    ensure_private_directory(path.parent)
+    existing = _lstat(path)
+    if existing is not None and stat.S_ISLNK(existing.st_mode):
+        temporary.unlink(missing_ok=True)
+        raise EdgeError(f"symlink destination refused: {path}")
     os.replace(temporary, path)
     try:
         path.chmod(mode)
@@ -145,6 +251,7 @@ def atomic_text(path: pathlib.Path, value: str, mode: int = 0o600) -> None:
 
 
 def load_json(path: pathlib.Path) -> dict[str, Any]:
+    _require_regular_file(path)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -189,6 +296,7 @@ def producer_principal_id(node: dict[str, Any]) -> str:
 
 def first_queue_observed_at(queue_path: pathlib.Path) -> str | None:
     try:
+        _require_regular_file(queue_path)
         with queue_path.open("r", encoding="utf-8", errors="strict") as handle:
             for number, line in enumerate(handle, start=1):
                 if not line.strip():
@@ -325,6 +433,7 @@ def read_sequence_state(path: pathlib.Path) -> int:
 
 def last_queue_sequence(queue_path: pathlib.Path) -> int:
     try:
+        _require_regular_file(queue_path)
         with queue_path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
             position = handle.tell()
@@ -405,10 +514,11 @@ def reconcile_delivery_state(
 
 def initialize() -> dict[str, Any]:
     layout = paths()
-    for key in ("root", "config", "state", "queue", "exports"):
-        ensure_private_directory(layout[key])
+    verify_live_layout(layout)
+    ensure_private_directory(layout["exports"], require_owner=False)
 
     with file_lock(layout["state"] / "initialize.lock"):
+        verify_live_layout(layout)
         node_path = layout["config"] / "node.json"
         if node_path.exists():
             node = load_json(node_path)
@@ -434,6 +544,7 @@ def initialize() -> dict[str, Any]:
             atomic_bytes(queue_path, b"")
 
         with file_lock(layout["state"] / "queue.lock"):
+            verify_live_layout(layout)
             reconcile_delivery_state(node, layout)
 
     return node
@@ -443,6 +554,7 @@ def delivery_stream_state() -> dict[str, Any]:
     node = initialize()
     layout = paths()
     with file_lock(layout["state"] / "queue.lock", shared=True):
+        verify_live_layout(layout)
         delivery = load_json(layout["state"] / "delivery-stream.json")
         validate_delivery_state(delivery, node)
         queued_high_water = last_queue_sequence(layout["queue"] / "events.jsonl")
@@ -458,6 +570,7 @@ def commit_event(event: dict[str, Any]) -> dict[str, Any]:
     queue_path = layout["queue"] / "events.jsonl"
     delivery_path = layout["state"] / "delivery-stream.json"
     with file_lock(layout["state"] / "queue.lock"):
+        verify_live_layout(layout)
         current = max(
             read_sequence_state(sequence_path),
             last_queue_sequence(queue_path),
@@ -481,7 +594,7 @@ def commit_event(event: dict[str, Any]) -> dict[str, Any]:
         ).encode("utf-8")
         if len(encoded) > MAX_EVENT_BYTES:
             raise EdgeError(f"event exceeds {MAX_EVENT_BYTES} encoded bytes")
-        fd = os.open(queue_path, os.O_APPEND | os.O_WRONLY)
+        fd = _open_regular_fd(queue_path, os.O_APPEND | os.O_WRONLY)
         try:
             write_all(fd, encoded)
             os.fsync(fd)
@@ -534,8 +647,10 @@ def read_events(limit: int | None = None) -> list[dict[str, Any]]:
     layout = paths()
     queue_path = layout["queue"] / "events.jsonl"
     with file_lock(layout["state"] / "queue.lock", shared=True):
+        verify_live_layout(layout)
         delivery = load_json(layout["state"] / "delivery-stream.json")
         validate_delivery_state(delivery, node)
+        _require_regular_file(queue_path)
         try:
             lines = queue_path.read_text(
                 encoding="utf-8",
@@ -612,7 +727,9 @@ def snapshot() -> dict[str, Any]:
         },
         "capabilities": load_json(layout["config"] / "capabilities.json"),
     }
-    atomic_json(layout["state"] / "status.json", status)
+    with file_lock(layout["state"] / "status.lock"):
+        verify_live_layout(layout)
+        atomic_json(layout["state"] / "status.json", status)
     return status
 
 
@@ -622,20 +739,30 @@ def export_queue(destination: pathlib.Path) -> pathlib.Path:
     source = layout["queue"] / "events.jsonl"
     if destination.is_dir():
         destination = destination / f"pleiades-edge-{int(time.time())}.jsonl"
-    destination = destination.expanduser()
-    if destination.resolve() == source.resolve():
+    destination = lexical_absolute(destination.expanduser())
+    if destination == source:
         raise EdgeError("export destination must differ from the live queue")
-    ensure_private_directory(destination.parent)
+    ensure_private_directory(destination.parent, require_owner=False)
     temporary = destination.with_name(
         f".{destination.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     )
     with file_lock(layout["state"] / "queue.lock", shared=True):
+        verify_live_layout(layout)
+        ensure_private_directory(destination.parent, require_owner=False)
         try:
-            with source.open("rb") as reader, temporary.open("xb") as writer:
+            reader_fd = _open_regular_fd(source, os.O_RDONLY)
+            writer_fd = _open_regular_fd(
+                temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+            )
+            with os.fdopen(reader_fd, "rb") as reader, os.fdopen(
+                writer_fd, "wb"
+            ) as writer:
                 shutil.copyfileobj(reader, writer)
                 writer.flush()
                 os.fsync(writer.fileno())
-            temporary.chmod(0o600)
+            existing = _lstat(destination)
+            if existing is not None and stat.S_ISLNK(existing.st_mode):
+                raise EdgeError(f"symlink export destination refused: {destination}")
             os.replace(temporary, destination)
             fsync_directory(destination.parent)
         except BaseException:
@@ -645,7 +772,12 @@ def export_queue(destination: pathlib.Path) -> pathlib.Path:
 
 
 def permission_string(path: pathlib.Path) -> str:
-    return oct(stat.S_IMODE(path.stat().st_mode)) if path.exists() else "missing"
+    observed = _lstat(path)
+    if observed is None:
+        return "missing"
+    if stat.S_ISLNK(observed.st_mode):
+        return "unsafe-symlink"
+    return oct(stat.S_IMODE(observed.st_mode))
 
 
 def doctor() -> tuple[dict[str, Any], bool]:
