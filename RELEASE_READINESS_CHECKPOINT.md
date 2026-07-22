@@ -9,10 +9,11 @@ Release publication authority: tag-only draft workflow; no tag or release author
 ## Last reviewed heads and receipts
 
 - Last fully validated release-readiness head before workflow hardening: `3f93a8a119681be5d157bb31731bc9d9e0d46148`
-- Exact CI run: `29669850443`
+- Earlier exact CI run: `29669850443`
 - CI supply-chain hardening head: `7ded37f8e0e6e415fc1adbc48889279117697d0e`
 - Release-workflow hardening head: `df9fc5b2d5c26693bad1256cda7cbad00fd15b29`
-- Current ledger head: pending this commit
+- Fully validated workflow-and-ledger head: `52cd5222ed81eacd584390501d481a61604bdf38`
+- Exact workflow-and-ledger CI run: `29879687749`
 
 ## Completed scope
 
@@ -33,7 +34,9 @@ Release publication authority: tag-only draft workflow; no tag or release author
 
 ## Validation receipts
 
-At exact head `3f93a8a119681be5d157bb31731bc9d9e0d46148`, CI run `29669850443` passed.
+At exact head `3f93a8a119681be5d157bb31731bc9d9e0d46148`, CI run `29669850443` passed the original release-readiness implementation.
+
+At exact head `52cd5222ed81eacd584390501d481a61604bdf38`, CI run `29879687749` passed after workflow hardening and ledger creation.
 
 The validated scope included:
 
@@ -44,9 +47,10 @@ The validated scope included:
 - two deterministic source builds and byte-for-byte comparison;
 - exact archive-manifest checks;
 - checksum verification;
-- exact-head candidate upload.
+- exact-head candidate upload;
+- immutable Action pins, explicit runner identities, disabled persisted checkout credentials, and release-tag ancestry enforcement.
 
-The workflow-hardening and ledger commits require a fresh exact-head CI receipt. The release workflow has not been executed because doing so would require an unauthorized public tag and release.
+Changed conclusion: the ordinary source and workflow checkpoint is green at the complete recorded head. The release workflow has not been executed because doing so would require an unauthorized public tag and release.
 
 ## External practices applied
 
@@ -95,4 +99,4 @@ Reprocess this repository only when one or more of the following changes:
 
 ## Next action
 
-Inspect exact-head CI for the workflow-and-ledger commits. If it passes, skip ordinary source reprocessing and move to stacked integration review plus a disposable real-Termux lifecycle fixture. Keep the repository on `HOLD` until dependency-order integration and a separately authorized prerelease validate the public distribution path.
+Skip ordinary source reprocessing until a trigger changes. The next substantive checkpoint is dependency-order review of the stacked edge-runtime, release-readiness, and delivery-continuity drafts, followed by a disposable real-Termux lifecycle fixture and one separately authorized prerelease. Keep the repository on `HOLD` until those gates are satisfied.
