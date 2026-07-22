@@ -2,30 +2,47 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - name: Compile edge runtime
-        run: python3 -m py_compile bin/pleiades-edge.py
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          show-progress: false
+          persist-credentials: false
+
+      - name: Compile Python surfaces
+        run: python3 -m py_compile bin/pleiades-edge.py ci/scan_public_repo.py scripts/write_spdx_sbom.py
+
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v
-      - name: Shell syntax
+
+      - name: Shell syntax and uninstall policy
+        id: shell
         run: |
-          bash -n env/pleiades-env.sh
-          bash -n env/pleiades-termux-lib.sh
-          bash -n env/pleiades-termux-cli.sh
-          bash -n env/bootstrap-termux.sh
+          set +e
+          bash -n env/*.sh scripts/package_source.sh tests/test_uninstall.sh > shell-parse.log 2>&1
+          parse_status=$?
+          bash tests/test_uninstall.sh > uninstall-tests.log 2>&1
+          test_status=$?
+          echo "parse_status=$parse_status" >> "$GITHUB_OUTPUT"
+          echo "test_status=$test_status" >> "$GITHUB_OUTPUT"
+          cat shell-parse.log uninstall-tests.log
+          exit 0
+
       - name: Edge boundary invariants
         run: |
           set -euo pipefail
@@ -33,8 +50,83 @@ jobs:
           ! grep -nE 'root\.x86_64/scripts|for script in .*scripts|API_KEY|settings\.json' env/bootstrap-termux.sh
           grep -Fq 'authority": "none"' bin/pleiades-edge.py
           grep -Fq 'authority": "observation-only"' bin/pleiades-edge.py
-          grep -Fq 'Event IDs and monotonic per-node sequence numbers' README.md
-      - name: Secret-shaped file guard
+          grep -Fq 'strictly increasing per-node sequences' README.md
+          grep -Fq 'no automatic network transmission' README.md
+          grep -Fq 'requires --yes because it deletes queued events' env/uninstall-termux.sh
+          ! find . -type f -not -path './.git/*' \( -name '*.key' -o -name '*.pem' -o -name '*.p12' -o -name '.env' \) -print -quit | grep -q .
+
+      - name: Capture public-tree and history scan
+        if: always()
+        id: sensitivity
+        run: |
+          set +e
+          python3 ci/scan_public_repo.py > sensitivity.log 2>&1
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          cat sensitivity.log
+          exit 0
+
+      - name: Preserve diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pleiades-termux-validation-${{ github.sha }}
+          path: |
+            shell-parse.log
+            uninstall-tests.log
+            sensitivity.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce validation gate
+        if: always()
+        run: |
+          test "${{ steps.shell.outputs.parse_status }}" = "0"
+          test "${{ steps.shell.outputs.test_status }}" = "0"
+          test "${{ steps.sensitivity.outputs.status }}" = "0"
+          test "$(cat VERSION)" = "0.2.0"
+
+  source-package:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          show-progress: false
+          persist-credentials: false
+
+      - name: Build twice and prove byte reproducibility
         run: |
           set -euo pipefail
-          ! find . -type f -not -path './.git/*' \( -name '*.key' -o -name '*.pem' -o -name '*.p12' -o -name '.env' \) -print -quit | grep -q .
+          bash scripts/package_source.sh dist-one
+          bash scripts/package_source.sh dist-two
+          for first in dist-one/*; do
+            file="$(basename "$first")"
+            cmp "$first" "dist-two/$file"
+          done
+
+      - name: Verify archive matches the reviewed source manifest
+        run: |
+          set -euo pipefail
+          VERSION="$(cat VERSION)"
+          ARCHIVE="dist-one/pleiades-termux-${VERSION}.tar.gz"
+          sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' release/source-files.txt \
+            | sed "s#^#pleiades-termux-${VERSION}/#" > expected-files.txt
+          tar -tzf "$ARCHIVE" | grep -v '/$' | LC_ALL=C sort > actual-files.txt
+          cmp expected-files.txt actual-files.txt
+          ! grep -Eq '/scripts/(Taygete|Celaeno|Sterope|Alcyone|Asterope|Atlas|Merope|Maia|Electra)\.sh$' actual-files.txt
+
+      - name: Verify checksum manifest
+        run: |
+          cd dist-one
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Upload exact-head source candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pleiades-termux-source-${{ github.sha }}
+          path: dist-one/
+          if-no-files-found: error
+          retention-days: 30
