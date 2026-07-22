@@ -15,13 +15,14 @@ concurrency:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
           show-progress: false
+          persist-credentials: false
 
       - name: Compile Python surfaces
         run: python3 -m py_compile bin/pleiades-edge.py ci/scan_public_repo.py scripts/write_spdx_sbom.py
@@ -67,7 +68,7 @@ jobs:
 
       - name: Preserve diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: pleiades-termux-validation-${{ github.sha }}
           path: |
@@ -87,13 +88,14 @@ jobs:
 
   source-package:
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
           show-progress: false
+          persist-credentials: false
 
       - name: Build twice and prove byte reproducibility
         run: |
@@ -122,7 +124,7 @@ jobs:
           sha256sum -c SHA256SUMS.txt
 
       - name: Upload exact-head source candidate
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: pleiades-termux-source-${{ github.sha }}
           path: dist-one/
