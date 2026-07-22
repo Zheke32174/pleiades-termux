@@ -14,19 +14,25 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
           show-progress: false
+          persist-credentials: false
 
-      - name: Validate immutable version identity
+      - name: Validate immutable version identity and ancestry
         run: |
           set -euo pipefail
           VERSION="$(tr -d '[:space:]' < VERSION)"
           test "$GITHUB_REF_NAME" = "v$VERSION"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main || {
+            echo "::error::Tagged commit is not reachable from main"
+            exit 1
+          }
 
       - name: Validate implementation and public history
         run: |
@@ -63,7 +69,7 @@ Also download:
 - `pleiades-termux-{version}.spdx.json` for the SPDX 2.3 source inventory;
 - `pleiades-termux-{version}.build-receipt.json` for the exact commit and package hashes.
 
-Extract inside Termux, then run `bash env/bootstrap-termux.sh --dry-run` before installation. Local queued observations are retained until the operator explicitly exports or purges them.
+Extract inside Termux, verify the checksum manifest, then run `bash env/bootstrap-termux.sh --dry-run` before installation. Local queued observations are retained until the operator explicitly exports or purges them.
 """
           Path("dist/RELEASE-NOTES.md").write_text(notes, encoding="utf-8")
           PY
